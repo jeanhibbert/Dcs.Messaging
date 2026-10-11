@@ -4,7 +4,7 @@ This document describes the internal architecture of Dcs.Messaging, with diagram
 
 ## Builder Class Hierarchy
 
-Applications create a session by instantiating a transport-specific builder. Both builders produce an `IMessagingSessionBuilder` with an identical API surface, so all downstream code is transport-agnostic.
+Applications create a session by instantiating a transport-specific builder. All three builders produce an `IMessagingSessionBuilder` with an identical API surface, so all downstream code is transport-agnostic.
 
 ```mermaid
 classDiagram
@@ -22,6 +22,7 @@ classDiagram
     class MessagingSessionBuilderBase {
         <<abstract>>
         #MessagingSessionBuilderBase(sessionName, provider, sessionId, transport, endpointProvider)
+        #MessagingSessionBuilderBase(sessionName, provider, sessionId, transport, endpointProvider, serializer)
     }
 
     class TcpMessagingSessionBuilder {
@@ -32,20 +33,26 @@ classDiagram
         +GrpcMessagingSessionBuilder(sessionName, provider, GrpcSessionOptions)
     }
 
+    class SbeMessagingSessionBuilder {
+        +SbeMessagingSessionBuilder(sessionName, provider, SbeSessionOptions)
+        +SbeMessagingSessionBuilder(sessionName, provider, SbeSessionOptions, SbeBinarySerializer)
+    }
+
     IMessagingSessionBuilder <|.. MessagingSessionBuilderBase
     MessagingSessionBuilderBase <|-- TcpMessagingSessionBuilder
     MessagingSessionBuilderBase <|-- GrpcMessagingSessionBuilder
+    MessagingSessionBuilderBase <|-- SbeMessagingSessionBuilder
 ```
 
 The abstract base class (`MessagingSessionBuilderBase`) wires the common services:
 
 - `MessageEndpointDetailsFactory` -- creates endpoint detail objects
 - `MessageFactory` -- creates `IMessage` instances stamped with the session ID
-- `ProtobufNetBinarySerializer` -- protobuf-net based binary serializer
+- `IBinarySerializer` -- `ProtobufNetBinarySerializer` by default. `SbeMessagingSessionBuilder` passes an `SbeBinarySerializer` through the second constructor.
 - `MessagingService` -- routes send/receive through the endpoint provider
 - `RequestResponder` -- request/response correlation layer
 
-Each concrete builder only needs to create its transport session and endpoint provider, then pass them to the base constructor.
+Each concrete builder creates its transport session and endpoint provider (and, if it needs one, its serializer), then passes them to the base constructor.
 
 ---
 
@@ -74,16 +81,19 @@ flowchart TB
 
     subgraph transport [Transport Layer - swappable]
         direction LR
-        subgraph tcpPath [TCP]
-            TCPS["TcpMessagingSession<br/>length-prefixed protobuf<br/>over raw TCP sockets"]
+        subgraph socketPath [Raw TCP sockets]
+            BASE["TcpTransportSessionBase<br/>accept / connect, routing,<br/>per-connection read loop"]
+            TCPS["TcpMessagingSession<br/>length-prefixed protobuf"]
+            SBES["SbeMessagingSession<br/>SOFH + SBE"]
         end
         subgraph grpcPath [gRPC]
             GRPCS["GrpcMessagingSession<br/>bidirectional streaming<br/>over HTTP/2"]
         end
     end
 
-    subgraph wire [Shared Wire Format]
+    subgraph wire [Wire Formats]
         ENV["TransportEnvelope<br/>(protobuf-net)"]
+        SENV["SBE TransportEnvelope<br/>(SbeTransportCodec)"]
     end
 
     APP --> ISB
@@ -94,9 +104,13 @@ flowchart TB
     IMS --> EP
     EP --> END
     END --> TCPS
+    END --> SBES
     END --> GRPCS
+    TCPS -.inherits.-> BASE
+    SBES -.inherits.-> BASE
     TCPS --> ENV
     GRPCS --> ENV
+    SBES --> SENV
 ```
 
 ### Key interfaces
@@ -106,7 +120,7 @@ flowchart TB
 | `IMessagingSessionBuilder` | Entry point. Provides all services needed by application code. |
 | `IMessagingService` | Send messages to and receive message streams from logical endpoints. |
 | `IRequestResponder` | Higher-level request/response pattern with automatic correlation. |
-| `IBinarySerializer` | Serialize/deserialize application payloads (protobuf-net). |
+| `IBinarySerializer` | Serialize/deserialize application payloads (protobuf-net, or SBE for the SBE builder). |
 | `IMessageFactory` | Create `IMessage` instances with session identity and properties. |
 | `IEndpointProvider` | Map `IEndpointDetails` to `IEndpoint` instances (transport-specific). |
 | `IEndpoint` | Low-level send/receive on a single logical endpoint within a session. |
@@ -123,7 +137,7 @@ sequenceDiagram
     participant Svc as IMessagingService
     participant EProv as IEndpointProvider
     participant EP as IEndpoint
-    participant Sess as Session (TCP or gRPC)
+    participant Sess as Session (TCP, gRPC or SBE)
     participant Factory as TransportEnvelopeFactory
     participant Wire as Network
 
@@ -132,12 +146,17 @@ sequenceDiagram
     EProv-->>Svc: IEndpoint
     Svc->>EP: Send(message, targetSessionId)
     EP->>Sess: Send(endpointDetails, message, targetSessionId)
-    Sess->>Factory: FromMessage(address, message, targetSessionId)
-    Factory-->>Sess: TransportEnvelope
     alt TCP transport
+        Sess->>Factory: FromMessage(address, message, targetSessionId)
+        Factory-->>Sess: TransportEnvelope
         Sess->>Wire: 4-byte length prefix + protobuf bytes
     else gRPC transport
+        Sess->>Factory: FromMessage(address, message, targetSessionId)
+        Factory-->>Sess: TransportEnvelope
         Sess->>Wire: IAsyncEnumerable stream item (HTTP/2)
+    else SBE transport
+        Sess->>Sess: SbeTransportCodec.EncodeFrame (directly from IMessage)
+        Sess->>Wire: SOFH + SBE TransportEnvelope
     end
 ```
 
@@ -156,7 +175,7 @@ Incoming messages are deserialized by the session, filtered by endpoint address 
 ```mermaid
 sequenceDiagram
     participant Wire as Network
-    participant Sess as Session (TCP or gRPC)
+    participant Sess as Session (TCP, gRPC or SBE)
     participant Factory as TransportEnvelopeFactory
     participant Subject as ISubject (Rx)
     participant EP as IEndpoint
@@ -166,11 +185,15 @@ sequenceDiagram
     Wire->>Sess: incoming bytes / stream item
     alt TCP transport
         Sess->>Sess: ReadEnvelopeAsync (length-prefixed protobuf)
+        Sess->>Factory: ToMessage(envelope)
+        Factory-->>Sess: IMessage
     else gRPC transport
         Sess->>Sess: await foreach on IAsyncEnumerable
+        Sess->>Factory: ToMessage(envelope)
+        Factory-->>Sess: IMessage
+    else SBE transport
+        Sess->>Sess: SbeTransportCodec.ReadFrameAsync (SOFH + SBE, decoded straight to IMessage)
     end
-    Sess->>Factory: ToMessage(envelope)
-    Factory-->>Sess: IMessage
     Sess->>Subject: OnNext(IncomingTransportMessage)
     Note over Subject: filtered by endpoint address<br/>and target session ID
     App->>Svc: GetMessageStream(endpointDetails)
@@ -219,9 +242,11 @@ sequenceDiagram
 
 ---
 
-## Wire Format: TransportEnvelope
+## Wire Formats
 
-Both TCP and gRPC use the same protobuf-serialized envelope (`TransportEnvelope`):
+### Protobuf envelope (TCP and gRPC)
+
+TCP and gRPC use the same protobuf-serialized envelope (`TransportEnvelope`):
 
 | ProtoMember | Field | Type | Description |
 |-------------|-------|------|-------------|
@@ -234,15 +259,50 @@ Both TCP and gRPC use the same protobuf-serialized envelope (`TransportEnvelope`
 
 Each `TransportPropertyValue` carries a `Key`, `Kind` (bool/double/int/string), and the corresponding typed value field. This allows message properties to round-trip across the wire without losing type information.
 
-### TCP framing
+#### TCP framing
 
 ```
 [4 bytes: big-endian int32 payload length][N bytes: protobuf-serialized TransportEnvelope]
 ```
 
-### gRPC framing
+#### gRPC framing
 
 The `TransportEnvelope` is sent as individual items in a bidirectional `IAsyncEnumerable<TransportEnvelope>` stream. HTTP/2 handles framing.
+
+### SBE envelope
+
+The SBE transport does not use the protobuf `TransportEnvelope`. `SbeTransportCodec` writes an SBE message straight from the `IMessage` into one exactly-sized buffer, and decodes incoming frames straight back into an `IMessage`. The schema is in `Dcs.Messaging/Sbe/Schemas/dcs-messaging-transport.xml` (schema id 1, template id 1, version 0).
+
+```
+SOFH     [uint32 BE frame length incl. SOFH][uint16 BE encoding type 0x5BE0]
+header   [uint16 blockLength][uint16 templateId][uint16 schemaId][uint16 version]     (little-endian from here on)
+block    [int32 timeToLiveMs][uint8 isPersistent]
+group    [uint16 blockLength][uint16 numInGroup]
+           numInGroup x { [double numericValue][uint8 kind] [key] [stringValue] }
+data     [endpointAddress][senderSessionId][targetSessionId][tag][payload]
+```
+
+| Part | Field | Encoding | Notes |
+|------|-------|----------|-------|
+| Root block | `timeToLiveMs` | `int32`, null = `int.MinValue` | `TransportPropertyKeys.TimeToLiveMs`. Fixed field because `MessageFactory` sets it on every message. |
+| Root block | `isPersistent` | `uint8`, 0/1, null = 255 | `TransportPropertyKeys.IsPersistent`, also set on every message. |
+| `properties` group | `numericValue` | `double` | Value for `Bool` (0/1), `Int` and `Double` kinds. Every int32 fits exactly in a double. |
+| `properties` group | `kind` | `uint8` enum | `Bool`, `Int`, `Double` or `String` |
+| `properties` group | `key`, `stringValue` | `varStringEncoding` | Other value types are sent as invariant-culture strings, as in the protobuf envelope. |
+| Data | `endpointAddress`, `senderSessionId`, `targetSessionId`, `tag` | `varStringEncoding` (uint16 length + UTF-8) | An empty `targetSessionId` means broadcast. |
+| Data | `payload` | `varDataEncoding` (uint32 length + bytes) | Application payload from the session's `IBinarySerializer` |
+
+Decoders honour the `blockLength` values on the wire, so a newer schema version can append fields to the root block or the group entries and older readers will skip them.
+
+With the SBE builder the application payload is SBE too. The schema for the sample DTOs is `Dcs.Messaging.Common/Sbe/dcs-messaging-common.xml` (schema id 2):
+
+| Template | DTO | Root block | Variable data |
+|----------|-----|------------|---------------|
+| 1 | `TestAlertDto` | `int32 messageId` | `serverName`, `message` |
+| 2 | `PricingRequestDto` | `double spotRate`, `CurrencyPair` | `requestedBy`, `tenor` |
+| 3 | `ForwardPricingDto` | `double bidRate`, `double askRate`, `CurrencyPair`, `uint8 isContra` | none (fixed 35 bytes including header) |
+
+`CurrencyPair` is a composite: `char[3] baseCcy`, `char[3] quoteCcy`, and optional `int32 decimalPlaces`.
 
 ---
 
@@ -266,8 +326,8 @@ To add your own endpoints, implement `IEndpointDetailsProvider` or extend `TestE
 
 The framework is designed to be extensible. To add a new transport (e.g. WebSocket, named pipes):
 
-1. Create a new session class (like `TcpMessagingSession` or `GrpcMessagingSession`) that implements `IDisposable` and exposes `GetMessageStream()` and `Send()` methods.
+1. Create a new session class (like `TcpMessagingSession` or `GrpcMessagingSession`) that implements `IDisposable` and exposes `GetMessageStream()` and `Send()` methods. If the new transport only changes the encoding of frames over raw TCP sockets, derive from `TcpTransportSessionBase` and implement `EncodeFrame` and `ReadFrameAsync`, as `SbeMessagingSession` does.
 2. Create a matching `IEndpointProvider` and `IEndpoint` implementation.
-3. Create a new builder class extending `MessagingSessionBuilderBase`, passing your session and endpoint provider to the base constructor.
+3. Create a new builder class extending `MessagingSessionBuilderBase`, passing your session and endpoint provider (and optionally an `IBinarySerializer`) to the base constructor.
 
 No existing code needs to change -- the Open/Closed principle is preserved by the builder hierarchy.

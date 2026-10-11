@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 15
 VisualStudioVersion = 15.0.27130.2027
@@ -16,6 +16,12 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.SkeletonServerApp.Grpc", "Dcs.Messaging.SkeletonServerApp.Grpc\Dcs.Messaging.SkeletonServerApp.Grpc.csproj", "{0B475296-1B7C-41C3-A72D-D98CEB0580DE}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.SkeletonClientApp.Grpc", "Dcs.Messaging.SkeletonClientApp.Grpc\Dcs.Messaging.SkeletonClientApp.Grpc.csproj", "{2B2D2450-F8E3-4527-861C-F3D45E8C93A0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.SkeletonServerApp.Sbe", "Dcs.Messaging.SkeletonServerApp.Sbe\Dcs.Messaging.SkeletonServerApp.Sbe.csproj", "{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.SkeletonClientApp.Sbe", "Dcs.Messaging.SkeletonClientApp.Sbe\Dcs.Messaging.SkeletonClientApp.Sbe.csproj", "{DBE7C9F4-313E-4323-AADA-A7BB735FD507}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.PerformanceTests", "Dcs.Messaging.PerformanceTests\Dcs.Messaging.PerformanceTests.csproj", "{E4CB5C20-0394-4569-B019-398455774163}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -111,6 +117,42 @@ Global
 		{2B2D2450-F8E3-4527-861C-F3D45E8C93A0}.Release|x64.Build.0 = Release|Any CPU
 		{2B2D2450-F8E3-4527-861C-F3D45E8C93A0}.Release|x86.ActiveCfg = Release|Any CPU
 		{2B2D2450-F8E3-4527-861C-F3D45E8C93A0}.Release|x86.Build.0 = Release|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Debug|x64.Build.0 = Debug|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Debug|x86.Build.0 = Debug|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Release|x64.ActiveCfg = Release|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Release|x64.Build.0 = Release|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Release|x86.ActiveCfg = Release|Any CPU
+		{787744BC-C8A3-4BCB-84B3-DAFE9ED06E9E}.Release|x86.Build.0 = Release|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Debug|x64.Build.0 = Debug|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Debug|x86.Build.0 = Debug|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Release|x64.ActiveCfg = Release|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Release|x64.Build.0 = Release|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Release|x86.ActiveCfg = Release|Any CPU
+		{DBE7C9F4-313E-4323-AADA-A7BB735FD507}.Release|x86.Build.0 = Release|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Debug|x64.Build.0 = Debug|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Debug|x86.Build.0 = Debug|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Release|x64.ActiveCfg = Release|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Release|x64.Build.0 = Release|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Release|x86.ActiveCfg = Release|Any CPU
+		{E4CB5C20-0394-4569-B019-398455774163}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

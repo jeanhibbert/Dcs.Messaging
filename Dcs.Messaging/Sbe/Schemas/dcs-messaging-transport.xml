@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+    SBE schema for the Dcs.Messaging transport envelope.
+    Implemented by hand in Sbe/SbeTransportCodec.cs; keep the two in sync.
+    On the wire each message is preceded by a Simple Open Framing Header:
+        uint32 big-endian message length (including the 6-byte SOFH) + uint16 big-endian encoding type 0x5BE0.
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="dcs.messaging.transport"
+                   id="1"
+                   version="0"
+                   semanticVersion="1.0"
+                   description="Dcs.Messaging transport envelope"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader" description="Message identifiers and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding" description="Repeating group dimensions">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <composite name="varStringEncoding" description="Variable-length UTF-8 string">
+            <type name="length" primitiveType="uint16" maxValue="65534"/>
+            <type name="varData" primitiveType="uint8" length="0" characterEncoding="UTF-8"/>
+        </composite>
+        <composite name="varDataEncoding" description="Variable-length opaque bytes">
+            <type name="length" primitiveType="uint32" maxValue="1073741824"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <type name="OptionalInt32" primitiveType="int32" presence="optional" nullValue="-2147483648"/>
+        <enum name="OptionalBoolean" encodingType="uint8" description="255 (the uint8 null value) means not set">
+            <validValue name="F">0</validValue>
+            <validValue name="T">1</validValue>
+        </enum>
+        <enum name="PropertyKind" encodingType="uint8" description="How numericValue / stringValue of a property entry is interpreted">
+            <validValue name="Bool">0</validValue>
+            <validValue name="Int">1</validValue>
+            <validValue name="Double">2</validValue>
+            <validValue name="String">3</validValue>
+        </enum>
+    </types>
+
+    <sbe:message name="TransportEnvelope" id="1" description="One application message routed to a logical endpoint">
+        <field name="timeToLiveMs" id="20" type="OptionalInt32" description="TransportPropertyKeys.TimeToLiveMs"/>
+        <field name="isPersistent" id="21" type="OptionalBoolean" presence="optional" description="TransportPropertyKeys.IsPersistent"/>
+        <group name="properties" id="10" dimensionType="groupSizeEncoding" description="All other message properties (CorrelationId, MessageKind, ...)">
+            <field name="numericValue" id="11" type="double" description="Bool (0/1), Int and Double values; int32 is exactly representable"/>
+            <field name="kind" id="12" type="PropertyKind"/>
+            <data name="key" id="13" type="varStringEncoding"/>
+            <data name="stringValue" id="14" type="varStringEncoding" description="String values; empty for other kinds"/>
+        </group>
+        <data name="endpointAddress" id="1" type="varStringEncoding"/>
+        <data name="senderSessionId" id="2" type="varStringEncoding"/>
+        <data name="targetSessionId" id="3" type="varStringEncoding" description="Empty means broadcast"/>
+        <data name="tag" id="4" type="varStringEncoding"/>
+        <data name="payload" id="5" type="varDataEncoding" description="Application payload encoded by the session's IBinarySerializer"/>
+    </sbe:message>
+</sbe:messageSchema>
