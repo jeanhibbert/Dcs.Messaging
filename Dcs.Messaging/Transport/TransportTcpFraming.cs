@@ -45,7 +45,7 @@ namespace Dcs.Messaging.Transport
             return Serializer.Deserialize<TransportEnvelope>(payloadStream);
         }
 
-        private static async Task<byte[]> ReadExactAsync(NetworkStream stream, int length, CancellationToken cancellationToken)
+        public static async Task<byte[]> ReadExactAsync(NetworkStream stream, int length, CancellationToken cancellationToken)
         {
             var buffer = new byte[length];
             var offset = 0;

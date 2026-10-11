@@ -21,6 +21,11 @@ namespace Dcs.Messaging
 
         public IEnumerable<object> Values => _values.Values;
 
+        /// <summary>
+        /// Live view of the underlying values for allocation-free enumeration by transport encoders. Do not mutate.
+        /// </summary>
+        internal Dictionary<string, object> Entries => _values;
+
         public bool GetBoolean(string key)
         {
             return _values.TryGetValue(key, out var value) && Convert.ToBoolean(value);

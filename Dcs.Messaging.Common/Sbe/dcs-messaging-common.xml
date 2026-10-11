@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+    SBE schema for the sample DTOs in Dcs.Messaging.Common.Dto.
+    Implemented by hand in the *SbeCodec classes in this folder; keep the two in sync.
+    These messages are carried as the payload of the transport envelope (Dcs.Messaging/Sbe/Schemas/dcs-messaging-transport.xml).
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="dcs.messaging.common"
+                   id="2"
+                   version="0"
+                   semanticVersion="1.0"
+                   description="Dcs.Messaging sample DTOs"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader" description="Message identifiers and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="varStringEncoding" description="Variable-length UTF-8 string">
+            <type name="length" primitiveType="uint16" maxValue="65534"/>
+            <type name="varData" primitiveType="uint8" length="0" characterEncoding="UTF-8"/>
+        </composite>
+        <enum name="BooleanType" encodingType="uint8">
+            <validValue name="F">0</validValue>
+            <validValue name="T">1</validValue>
+        </enum>
+        <type name="CurrencyCode" primitiveType="char" length="3" characterEncoding="US-ASCII" description="ISO 4217 code; all nulls means null"/>
+        <composite name="CurrencyPair">
+            <ref name="baseCcy" type="CurrencyCode"/>
+            <ref name="quoteCcy" type="CurrencyCode"/>
+            <type name="decimalPlaces" primitiveType="int32" presence="optional" nullValue="-2147483648"/>
+        </composite>
+    </types>
+
+    <sbe:message name="TestAlert" id="1" description="TestAlertDto">
+        <field name="messageId" id="1" type="int32"/>
+        <data name="serverName" id="2" type="varStringEncoding"/>
+        <data name="message" id="3" type="varStringEncoding"/>
+    </sbe:message>
+
+    <sbe:message name="PricingRequest" id="2" description="PricingRequestDto">
+        <field name="spotRate" id="1" type="double"/>
+        <field name="currencyPair" id="2" type="CurrencyPair"/>
+        <data name="requestedBy" id="3" type="varStringEncoding"/>
+        <data name="tenor" id="4" type="varStringEncoding"/>
+    </sbe:message>
+
+    <sbe:message name="ForwardPricing" id="3" description="ForwardPricingDto">
+        <field name="bidRate" id="1" type="double"/>
+        <field name="askRate" id="2" type="double"/>
+        <field name="currencyPair" id="3" type="CurrencyPair"/>
+        <field name="isContra" id="4" type="BooleanType"/>
+    </sbe:message>
+</sbe:messageSchema>

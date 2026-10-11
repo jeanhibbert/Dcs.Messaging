@@ -13,11 +13,22 @@ namespace Dcs.Messaging.Common
             string sessionId,
             IDisposable transport,
             IEndpointProvider endpointProvider)
+            : this(sessionName, endpointDetailsProvider, sessionId, transport, endpointProvider, new ProtobufNetBinarySerializer())
+        {
+        }
+
+        protected MessagingSessionBuilderBase(
+            string sessionName,
+            IEndpointDetailsProvider endpointDetailsProvider,
+            string sessionId,
+            IDisposable transport,
+            IEndpointProvider endpointProvider,
+            IBinarySerializer serializer)
         {
             EndpointDetailsProvider = endpointDetailsProvider;
             EndpointDetailsFactory = new MessageEndpointDetailsFactory();
             MessageFactory = new MessageFactory(sessionId ?? sessionName);
-            Serializer = new ProtobufNetBinarySerializer();
+            Serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
             MessagingTransport = transport;
 
             MessagingService = new TcpMessagingService(endpointProvider);
