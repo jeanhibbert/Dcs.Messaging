@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 15
-VisualStudioVersion = 15.0.27130.2027
+# Visual Studio Version 18
+VisualStudioVersion = 18.10.12224.181 stable
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.SkeletonClientApp", "Dcs.Messaging.SkeletonClientApp\Dcs.Messaging.SkeletonClientApp.csproj", "{85C747FC-D9A7-4152-8FF6-89A7182E4C89}"
 EndProject
@@ -22,6 +22,13 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.SkeletonClientApp.Sbe", "Dcs.Messaging.SkeletonClientApp.Sbe\Dcs.Messaging.SkeletonClientApp.Sbe.csproj", "{DBE7C9F4-313E-4323-AADA-A7BB735FD507}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Dcs.Messaging.PerformanceTests", "Dcs.Messaging.PerformanceTests\Dcs.Messaging.PerformanceTests.csproj", "{E4CB5C20-0394-4569-B019-398455774163}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{A54659D3-D836-4697-943F-8D69C2A3B39B}"
+	ProjectSection(SolutionItems) = preProject
+		docs\ARCHITECTURE.md = docs\ARCHITECTURE.md
+		docs\REACTIVE-EXTENSIONS-AND-TRANSPORTS.md = docs\REACTIVE-EXTENSIONS-AND-TRANSPORTS.md
+		docs\README.md = docs\README.md
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
