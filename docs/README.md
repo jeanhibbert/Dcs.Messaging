@@ -7,6 +7,7 @@ Dcs.Messaging is a protocol-agnostic .NET messaging framework that supports **TC
 - [Solution Structure](#solution-structure)
 - [Namespace Overview](#namespace-overview)
 - [Architecture Overview](#architecture-overview)
+- [Reactive Extensions, Transports and Serialization guide](REACTIVE-EXTENSIONS-AND-TRANSPORTS.md)
 - [Getting Started](#getting-started)
 - [Transports](#transports)
 - [Running the Samples](#running-the-samples)
@@ -101,6 +102,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams covering:
 - Send and receive sequences
 - Request/response pattern
 - Wire formats (protobuf envelope and SBE envelope)
+
+See [REACTIVE-EXTENSIONS-AND-TRANSPORTS.md](REACTIVE-EXTENSIONS-AND-TRANSPORTS.md) for a guide to:
+
+- how the framework uses Reactive Extensions, and the trade-offs of that design;
+- an end-to-end diagram showing how the parts fit together;
+- the strengths and weaknesses of each transport and serializer;
+- use cases, including when to choose gRPC over TCP and when to consider SBE.
 
 ---
 
