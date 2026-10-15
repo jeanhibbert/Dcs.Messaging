@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>Dcs.DataTransport.DemoClient</RootNamespace>
+    <AssemblyName>Dcs.DataTransport.DemoClient</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Dcs.DataTransport.Demo.Shared\Dcs.DataTransport.Demo.Shared.csproj" />
+  </ItemGroup>
+</Project>
