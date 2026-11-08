@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>Light.Messaging.ServerApp</RootNamespace>
+    <AssemblyName>Light.Messaging.ServerApp</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Light.Messaging.Contracts\Light.Messaging.Contracts.csproj" />
+    <ProjectReference Include="..\Light.Messaging.Grpc\Light.Messaging.Grpc.csproj" />
+  </ItemGroup>
+</Project>
