@@ -1,4 +1,5 @@
 using Light.Messaging.Internal;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -175,6 +176,7 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
             _peers = [.. _peers, connection.Peer];
         }
 
+        Logger.LogInformation("Peer {Peer} connected", connection.Peer);
         PeerConnected?.Invoke(connection.Peer);
     }
 
@@ -237,6 +239,8 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
             }
         }
 
+        ReportDrops(connection);
+        Logger.LogInformation("Peer {Peer} disconnected: {Reason}", connection.Peer, connection.CloseReason);
         PeerDisconnected?.Invoke(connection.Peer);
     }
 

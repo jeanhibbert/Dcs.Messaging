@@ -35,7 +35,7 @@ public sealed class Peer
     public int QueuedFrames => Connection.QueuedFrames;
 
     /// <summary>
-    /// Frames discarded because the queue was full (only under the DropOldest and DropNewest policies).
+    /// Published messages discarded for this peer because its queue was full (DropOldest and DropNewest policies).
     /// </summary>
     public long DroppedFrames => Connection.DroppedFrames;
 
@@ -62,24 +62,27 @@ public readonly struct MessageContext
 }
 
 /// <summary>
-/// What happens when a peer's send queue is full because the peer (or the network) is not keeping up. Publishing never
-/// blocks, and other peers are unaffected whichever policy is chosen.
+/// What happens when a peer's send queue is full of published messages because the peer (or the network) is not
+/// keeping up. Publishing never blocks, and other peers are unaffected, whichever policy is chosen. Only published
+/// messages are ever dropped: responses and control frames always get through. Drops are counted in
+/// <see cref="Peer.DroppedFrames"/> and logged as a warning at most once per check (about once a second) per peer.
 /// </summary>
 public enum SlowConsumerPolicy
 {
     /// <summary>
-    /// Close the connection. Nothing is silently lost: the peer sees a disconnect and must recover. The safe default
-    /// for orders and other streams where a gap is unacceptable.
-    /// </summary>
-    Disconnect,
-
-    /// <summary>
-    /// Discard the oldest queued frame. Suits prices and other state that newer messages supersede.
+    /// Discard the oldest queued message to make room. The consumer sees gaps but stays current. The default; suits
+    /// prices and other state that newer messages supersede.
     /// </summary>
     DropOldest,
 
     /// <summary>
-    /// Discard the frame being sent.
+    /// Close the connection. Nothing is silently lost: the peer sees a disconnect and must recover. Use it for orders
+    /// and other streams where a gap is unacceptable.
+    /// </summary>
+    Disconnect,
+
+    /// <summary>
+    /// Discard the message being published.
     /// </summary>
     DropNewest
 }

@@ -1,4 +1,5 @@
 using Light.Messaging.Internal;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -11,70 +12,80 @@ using System.Threading.Tasks;
 namespace Light.Messaging;
 
 /// <summary>
-/// One connection to a <see cref="MessagingServer"/>: subscribes to what it publishes, publishes to it, and sends it
+/// A connection to a <see cref="MessagingServer"/>: subscribes to what it publishes, publishes to it, and sends it
 /// requests.
 /// <code>
 /// await using var client = await MessagingClient.ConnectAsync(new TcpClientTransport("10.0.0.5", 5070));
 /// using var prices = client.Subscribe&lt;PriceTick&gt;(Endpoints.Prices, tick => ...);
 /// var price = await client.RequestAsync&lt;PricingRequest, ForwardPrice&gt;(Endpoints.Pricing, request);
 /// </code>
-/// The client does not reconnect by itself: watch <see cref="Disconnected"/> or <see cref="Completion"/>, then connect
-/// a new client and subscribe again.
+/// <para>
+/// If the connection drops, the client reconnects with backoff (<see cref="MessagingClientOptions.AutoReconnect"/>)
+/// and restores every subscription, then raises <see cref="Reconnected"/>. While it is disconnected, Publish and
+/// RequestAsync fail immediately rather than queueing: replaying an order minutes later is worse than rejecting it.
+/// Messages the server published during the outage are not replayed, so use <see cref="Reconnected"/> to refresh
+/// state, for example by requesting a snapshot.
+/// </para>
 /// </summary>
 public sealed class MessagingClient : MessagingSession, IConnectionOwner
 {
     private static readonly TimeSpan TimeoutCheckPeriod = TimeSpan.FromMilliseconds(10);
 
     private readonly ConcurrentDictionary<long, PendingRequest> _pending = new();
-    private readonly TimeSpan _requestTimeout;
+    private readonly ClientTransport _transport;
+    private readonly MessagingClientOptions _options;
     private readonly Timer _timeoutTimer;
+    private readonly CancellationTokenSource _disposing = new();
     private Connection _connection;
-    private Task _run = Task.CompletedTask;
+    private Task _supervisor = Task.CompletedTask;
     private long _lastCorrelationId;
 
-    private MessagingClient(MessagingClientOptions options)
+    private MessagingClient(ClientTransport transport, MessagingClientOptions options)
         : base(options, "client")
     {
-        _requestTimeout = options.RequestTimeout;
+        _transport = transport;
+        _options = options;
         _timeoutTimer = new Timer(static state => ((MessagingClient)state).FailExpiredRequests(), this, Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
-    /// Raised once when the connection closes, with the reason.
+    /// Raised each time the connection is lost, with the reason. Pending requests have already failed.
     /// </summary>
     public event Action<string> Disconnected;
 
-    public Peer Server => _connection.Peer;
-
-    public bool IsConnected => !_connection.IsClosed;
+    /// <summary>
+    /// Raised after an automatic reconnect, once subscriptions have been restored, with the new server peer.
+    /// </summary>
+    public event Action<Peer> Reconnected;
 
     /// <summary>
-    /// Completes when the connection has closed. Never faults.
+    /// The server as seen by the current connection (a new <see cref="Peer"/> after each reconnect).
     /// </summary>
-    public Task Completion => _run;
+    public Peer Server => Volatile.Read(ref _connection).Peer;
 
+    /// <summary>
+    /// False while the connection is down, including while reconnecting.
+    /// </summary>
+    public bool IsConnected => !Volatile.Read(ref _connection).IsClosed;
+
+    /// <summary>
+    /// Completes when the client stops for good: it was disposed, reconnecting is disabled, or it gave up after
+    /// <see cref="MessagingClientOptions.MaxReconnectAttempts"/>. Never faults.
+    /// </summary>
+    public Task Completion => _supervisor;
+
+    /// <summary>
+    /// Connects once, without retrying. Throws if the server cannot be reached or the handshake fails.
+    /// </summary>
     public static async Task<MessagingClient> ConnectAsync(ClientTransport transport, MessagingClientOptions options = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(transport);
         options ??= new MessagingClientOptions();
 
-        var client = new MessagingClient(options);
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(options.ConnectTimeout);
-
-        client._connection = await transport.ConnectAsync(client.ConnectionSettings, timeout.Token).ConfigureAwait(false);
-        client._run = client._connection.RunAsync(client);
-        try
-        {
-            await client._connection.Handshake.WaitAsync(timeout.Token).ConfigureAwait(false);
-        }
-        catch
-        {
-            client._connection.Close("handshake failed");
-            await client._run.ConfigureAwait(false);
-            throw;
-        }
-
+        var client = new MessagingClient(transport, options);
+        var (connection, run) = await client.ConnectOnceAsync(cancellationToken).ConfigureAwait(false);
+        Volatile.Write(ref client._connection, connection);
+        client._supervisor = client.SuperviseAsync(run);
         client._timeoutTimer.Change(TimeoutCheckPeriod, TimeoutCheckPeriod);
         client.StartWatchdog();
         return client;
@@ -83,25 +94,25 @@ public sealed class MessagingClient : MessagingSession, IConnectionOwner
     /// <summary>
     /// Sends <paramref name="message"/> to the server's subscribers for <paramref name="endpoint"/>. Never blocks.
     /// </summary>
-    /// <exception cref="MessagingException">The connection has closed.</exception>
+    /// <exception cref="MessagingException">Not connected (closed, or reconnecting).</exception>
     public void Publish<T>(Endpoint endpoint, T message)
     {
-        ThrowIfClosed();
-        _connection.Enqueue(CreateFrame(FrameKind.Publish, endpoint.Id, 0, message));
+        var connection = ConnectedOrThrow();
+        connection.Enqueue(CreateFrame(FrameKind.Publish, endpoint.Id, 0, message));
     }
 
     /// <summary>
     /// Sends a request and completes with the server's response. Fails with <see cref="RemoteException"/> if the
     /// responder threw, <see cref="TimeoutException"/> after <paramref name="timeout"/> (default
     /// <see cref="MessagingClientOptions.RequestTimeout"/>, checked every 10 ms), or <see cref="MessagingException"/>
-    /// if the connection closes. Await the result exactly once.
+    /// if the connection is down or drops before the response arrives. Await the result exactly once.
     /// </summary>
     public ValueTask<TResponse> RequestAsync<TRequest, TResponse>(Endpoint endpoint, TRequest request, TimeSpan? timeout = null)
     {
-        ThrowIfClosed();
+        var connection = ConnectedOrThrow();
 
         var correlationId = Interlocked.Increment(ref _lastCorrelationId);
-        var deadline = Stopwatch.GetTimestamp() + (long)((timeout ?? _requestTimeout).TotalSeconds * Stopwatch.Frequency);
+        var deadline = Stopwatch.GetTimestamp() + (long)((timeout ?? _options.RequestTimeout).TotalSeconds * Stopwatch.Frequency);
         var pending = PendingRequest<TResponse>.Rent(Serializer, deadline);
         var result = pending.Task;
 
@@ -119,29 +130,35 @@ public sealed class MessagingClient : MessagingSession, IConnectionOwner
             return result;
         }
 
-        if (!_connection.Enqueue(frame))
+        if (!connection.Enqueue(frame))
         {
-            FailPending(correlationId, new MessagingException($"Request not sent: {_connection.CloseReason ?? "send queue full"}."));
+            FailPending(correlationId, new MessagingException($"Request not sent ({connection.CloseReason ?? "connection closing"})"));
         }
 
         return result;
     }
 
     /// <summary>
-    /// Sends what is queued (up to <see cref="MessagingOptions.ShutdownDrainTimeout"/>), then closes the connection.
+    /// Stops reconnecting, sends what is queued (up to <see cref="MessagingOptions.ShutdownDrainTimeout"/>), then closes.
     /// </summary>
     public override async ValueTask DisposeAsync()
     {
+        if (_disposing.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _disposing.Cancel();
         await _timeoutTimer.DisposeAsync().ConfigureAwait(false);
         await StopWatchdogAsync().ConfigureAwait(false);
 
-        _connection.Shutdown("client disposed");
-        if (await Task.WhenAny(_run, Task.Delay(ShutdownDrainTimeout)).ConfigureAwait(false) != _run)
+        Volatile.Read(ref _connection).Shutdown("client disposed");
+        if (await Task.WhenAny(_supervisor, Task.Delay(ShutdownDrainTimeout)).ConfigureAwait(false) != _supervisor)
         {
-            _connection.Close("client disposed (drain timed out)");
+            Volatile.Read(ref _connection).Close("client disposed (drain timed out)");
         }
 
-        await _run.ConfigureAwait(false);
+        await _supervisor.ConfigureAwait(false);
     }
 
     void IConnectionOwner.OnConnected(Connection connection)
@@ -179,9 +196,20 @@ public sealed class MessagingClient : MessagingSession, IConnectionOwner
 
     void IConnectionOwner.OnClosed(Connection connection)
     {
+        // Requests in flight cannot be resent safely: the server may already have acted on them.
         foreach (var correlationId in _pending.Keys)
         {
-            FailPending(correlationId, new MessagingException($"Connection closed: {connection.CloseReason}."));
+            FailPending(correlationId, new MessagingException($"Connection lost before the response arrived ({connection.CloseReason})"));
+        }
+
+        ReportDrops(connection);
+        if (!_disposing.IsCancellationRequested)
+        {
+            Logger.LogWarning(
+                "Connection to {Server} lost ({Reason}){Reconnecting}",
+                connection.Peer,
+                connection.CloseReason,
+                _options.AutoReconnect ? "; reconnecting" : string.Empty);
         }
 
         Disconnected?.Invoke(connection.CloseReason);
@@ -189,25 +217,121 @@ public sealed class MessagingClient : MessagingSession, IConnectionOwner
 
     private protected override void OnFirstSubscription(Endpoint endpoint)
     {
-        _connection.EnqueueControl(FrameKind.Subscribe, endpoint.Id);
+        // While reconnecting this goes to the closed connection and is discarded; the reconnect resubscribes.
+        Volatile.Read(ref _connection).EnqueueControl(FrameKind.Subscribe, endpoint.Id);
     }
 
     private protected override void OnLastUnsubscription(Endpoint endpoint)
     {
-        _connection.EnqueueControl(FrameKind.Unsubscribe, endpoint.Id);
+        Volatile.Read(ref _connection).EnqueueControl(FrameKind.Unsubscribe, endpoint.Id);
     }
 
     private protected override IEnumerable<Connection> ActiveConnections()
     {
-        yield return _connection;
+        yield return Volatile.Read(ref _connection);
     }
 
-    private void ThrowIfClosed()
+    private async Task<(Connection Connection, Task Run)> ConnectOnceAsync(CancellationToken cancellationToken)
     {
-        if (_connection.IsClosed)
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_options.ConnectTimeout);
+
+        var connection = await _transport.ConnectAsync(ConnectionSettings, timeout.Token).ConfigureAwait(false);
+        var run = connection.RunAsync(this);
+        try
         {
-            throw new MessagingException($"Not connected: {_connection.CloseReason}.");
+            await connection.Handshake.WaitAsync(timeout.Token).ConfigureAwait(false);
         }
+        catch
+        {
+            connection.Close("handshake failed");
+            await run.ConfigureAwait(false);
+            throw;
+        }
+
+        return (connection, run);
+    }
+
+    /// <summary>
+    /// Runs each connection to its end, then reconnects, until disposed or reconnecting gives up.
+    /// </summary>
+    private async Task SuperviseAsync(Task run)
+    {
+        while (true)
+        {
+            await run.ConfigureAwait(false);
+            if (_disposing.IsCancellationRequested || !_options.AutoReconnect)
+            {
+                return;
+            }
+
+            var reconnected = await ReconnectAsync().ConfigureAwait(false);
+            if (reconnected == null)
+            {
+                return;
+            }
+
+            run = reconnected;
+        }
+    }
+
+    /// <summary>
+    /// Returns the new connection's run task, or null if disposed or out of attempts.
+    /// </summary>
+    private async Task<Task> ReconnectAsync()
+    {
+        var delay = _options.ReconnectMinDelay;
+        for (var attempt = 1; _options.MaxReconnectAttempts == 0 || attempt <= _options.MaxReconnectAttempts; attempt++)
+        {
+            try
+            {
+                await Task.Delay(WithJitter(delay), _disposing.Token).ConfigureAwait(false);
+                var (connection, run) = await ConnectOnceAsync(_disposing.Token).ConfigureAwait(false);
+
+                var restored = SwapUnderSubscriptionLock(
+                    () => Volatile.Write(ref _connection, connection),
+                    endpointId => connection.EnqueueControl(FrameKind.Subscribe, endpointId));
+
+                if (_disposing.IsCancellationRequested)
+                {
+                    connection.Shutdown("client disposed");
+                    return run;
+                }
+
+                Logger.LogInformation("Reconnected to {Server} after {Attempts} attempt(s); restored {Subscriptions} subscription(s)", connection.Peer, attempt, restored);
+                Reconnected?.Invoke(connection.Peer);
+                return run;
+            }
+            catch (OperationCanceledException) when (_disposing.IsCancellationRequested)
+            {
+                return null;
+            }
+            catch (Exception exception)
+            {
+                delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, _options.ReconnectMaxDelay.Ticks));
+                Logger.LogWarning("Reconnect attempt {Attempt} failed ({Reason}); retrying in about {Delay} ms", attempt, exception.Message, (int)delay.TotalMilliseconds);
+            }
+        }
+
+        Logger.LogError("Gave up reconnecting after {Attempts} attempt(s)", _options.MaxReconnectAttempts);
+        return null;
+    }
+
+    private static TimeSpan WithJitter(TimeSpan delay)
+    {
+        return TimeSpan.FromTicks((long)(delay.Ticks * (0.8 + Random.Shared.NextDouble() * 0.4)));
+    }
+
+    private Connection ConnectedOrThrow()
+    {
+        var connection = Volatile.Read(ref _connection);
+        if (connection.IsClosed)
+        {
+            var state = _disposing.IsCancellationRequested || !_options.AutoReconnect ? "closed" : "reconnecting";
+            throw new MessagingException($"Not connected, {state} ({connection.CloseReason})");
+        }
+
+        return connection;
     }
 
     private void FailPending(long correlationId, Exception exception)

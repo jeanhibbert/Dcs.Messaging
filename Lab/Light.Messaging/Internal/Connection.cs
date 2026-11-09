@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace Light.Messaging.Internal;
@@ -42,8 +41,7 @@ internal abstract class Connection
 {
     private static readonly TimeSpan GracefulCloseTimeout = TimeSpan.FromSeconds(5);
 
-    private readonly Channel<Frame> _outbound;
-    private readonly bool _disconnectWhenFull;
+    private readonly FrameQueue _outbound;
     private readonly CancellationTokenSource _closed = new();
     private readonly TaskCompletionSource _handshake = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private IConnectionOwner _owner;
@@ -51,6 +49,8 @@ internal abstract class Connection
     private string _shutdownReason;
     private long _sendStartedAt;
     private long _droppedFrames;
+    private long _reportedDroppedFrames;
+    private int _lastDroppedEndpointId;
     private bool _helloReceived;
     private bool _peerSaidGoodbye;
     private volatile bool _closingGracefully;
@@ -60,24 +60,7 @@ internal abstract class Connection
         Settings = settings;
         RemoteAddress = remoteAddress;
         Peer = new Peer(this);
-        _disconnectWhenFull = settings.SlowConsumerPolicy == SlowConsumerPolicy.Disconnect;
-
-        var options = new BoundedChannelOptions(settings.QueueCapacity)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-
-            // The send loop must never run on the publisher's thread, or one slow socket would delay every other peer.
-            AllowSynchronousContinuations = false,
-            FullMode = settings.SlowConsumerPolicy switch
-            {
-                SlowConsumerPolicy.DropOldest => BoundedChannelFullMode.DropOldest,
-                SlowConsumerPolicy.DropNewest => BoundedChannelFullMode.DropWrite,
-                _ => BoundedChannelFullMode.Wait
-            }
-        };
-
-        _outbound = Channel.CreateBounded<Frame>(options, OnFrameDropped);
+        _outbound = new FrameQueue(settings.QueueCapacity, settings.SlowConsumerPolicy);
     }
 
     public ConnectionSettings Settings { get; }
@@ -94,9 +77,23 @@ internal abstract class Connection
 
     public bool IsClosed => Volatile.Read(ref _closeReason) != null;
 
-    public int QueuedFrames => _outbound.Reader.Count;
+    public int QueuedFrames => _outbound.Count;
 
     public long DroppedFrames => Interlocked.Read(ref _droppedFrames);
+
+    /// <summary>
+    /// Endpoint of the most recently dropped message, for the slow-consumer warning.
+    /// </summary>
+    public int LastDroppedEndpointId => Volatile.Read(ref _lastDroppedEndpointId);
+
+    /// <summary>
+    /// Frames dropped since the previous call; safe to call from the watchdog and the close path at once.
+    /// </summary>
+    public long TakeUnreportedDrops()
+    {
+        var dropped = DroppedFrames;
+        return dropped - Interlocked.Exchange(ref _reportedDroppedFrames, dropped);
+    }
 
     /// <summary>
     /// Completes when the peer's Hello has been accepted; faults if the connection closes first.
@@ -110,24 +107,34 @@ internal abstract class Connection
     public HashSet<int> RemoteSubscriptions { get; } = new();
 
     /// <summary>
-    /// Queues a frame for sending and takes ownership of one of its references. Never blocks.
+    /// Queues a frame for sending and takes ownership of one of its references. Never blocks. Returns false if this
+    /// frame will not be sent.
     /// </summary>
     public bool Enqueue(Frame frame)
     {
-        if (_outbound.Writer.TryWrite(frame))
+        switch (_outbound.Enqueue(frame, out var dropped))
         {
-            return true;
+            case EnqueueResult.Queued:
+                if (dropped != null)
+                {
+                    RecordDrop(dropped);
+                }
+
+                return true;
+
+            case EnqueueResult.DroppedNewest:
+                RecordDrop(frame);
+                return false;
+
+            case EnqueueResult.Full:
+                frame.Release();
+                Close("send queue full: peer is not keeping up");
+                return false;
+
+            default:
+                frame.Release();
+                return false;
         }
-
-        frame.Release();
-
-        // A completed queue (shutting down or closed) also refuses frames; only a full one is the peer's fault.
-        if (_disconnectWhenFull && Volatile.Read(ref _shutdownReason) == null && !IsClosed)
-        {
-            Close("send queue full: peer is not keeping up");
-        }
-
-        return false;
     }
 
     public void EnqueueControl(FrameKind kind, int endpointId)
@@ -151,8 +158,8 @@ internal abstract class Connection
         var goodbye = Frame.Rent(FrameKind.Goodbye, 0);
         goodbye.WriteUtf8(reason);
         goodbye.Seal(Settings.MaxFrameBytes);
-        _outbound.Writer.TryWrite(goodbye);
-        _outbound.Writer.TryComplete();
+        Enqueue(goodbye);
+        _outbound.Complete(discard: false);
     }
 
     /// <summary>
@@ -165,7 +172,7 @@ internal abstract class Connection
             return;
         }
 
-        _outbound.Writer.TryComplete();
+        _outbound.Complete(discard: true);
 
         // Transport teardown runs on the thread pool, not on the caller, which may be a publisher.
         _ = _closed.CancelAsync();
@@ -224,7 +231,7 @@ internal abstract class Connection
 
         await Task.WhenAll(sending, receiving).ConfigureAwait(false);
 
-        while (_outbound.Reader.TryRead(out var frame))
+        while (_outbound.TryDequeue(out var frame))
         {
             frame.Release();
         }
@@ -365,12 +372,12 @@ internal abstract class Connection
     {
         // On the pinned object heap, so the socket layer does not pin and unpin it on every write.
         var batch = GC.AllocateUninitializedArray<byte>(Settings.SendBatchBytes, pinned: true);
-        var reader = _outbound.Reader;
         Frame carried = null;
 
         try
         {
-            while (carried != null || await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            // Close completes the queue, which ends the wait; the token covers sends already in progress.
+            while (carried != null || await _outbound.WaitToReadAsync().ConfigureAwait(false))
             {
                 // Take everything already queued, without waiting for more: batching never adds latency.
                 var length = 0;
@@ -378,7 +385,7 @@ internal abstract class Connection
                 {
                     var frame = carried;
                     carried = null;
-                    if (frame == null && !reader.TryRead(out frame))
+                    if (frame == null && !_outbound.TryDequeue(out frame))
                     {
                         break;
                     }
@@ -459,8 +466,13 @@ internal abstract class Connection
         }
     }
 
-    private void OnFrameDropped(Frame frame)
+    /// <summary>
+    /// Only counts: the session's watchdog turns the count into at most one warning per peer per check, so a flood of
+    /// drops never becomes a flood of log lines.
+    /// </summary>
+    private void RecordDrop(Frame frame)
     {
+        Volatile.Write(ref _lastDroppedEndpointId, frame.EndpointId);
         Interlocked.Increment(ref _droppedFrames);
         frame.Release();
     }

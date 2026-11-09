@@ -44,6 +44,14 @@ public readonly struct Endpoint : IEquatable<Endpoint>
     public static bool operator !=(Endpoint left, Endpoint right) => !left.Equals(right);
 
     /// <summary>
+    /// The address for an id, if this process has created that endpoint; otherwise the id itself.
+    /// </summary>
+    internal static string Describe(int id)
+    {
+        return AddressesById.TryGetValue(id, out var address) ? address : $"#{id}";
+    }
+
+    /// <summary>
     /// FNV-1a over the UTF-8 bytes: stable across processes, platforms and .NET versions, unlike
     /// <see cref="string.GetHashCode()"/>.
     /// </summary>

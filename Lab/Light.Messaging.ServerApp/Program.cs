@@ -2,6 +2,7 @@ using Light.Messaging.Contracts;
 using Light.Messaging.Grpc;
 using Light.Messaging.Tcp;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
 using System.Threading;
@@ -24,11 +25,19 @@ internal static class Program
         var host = settings.GetValue("host", "127.0.0.1");
         var port = settings.GetValue("port", 5070);
 
+        // Connections, slow-consumer warnings and handler errors are logged by the library itself.
+        using var loggerFactory = LoggerFactory.Create(logging => logging.AddSimpleConsole(console =>
+        {
+            console.SingleLine = true;
+            console.TimestampFormat = "HH:mm:ss.fff ";
+        }));
+
         ServerTransport transport = useGrpc ? new GrpcServerTransport(host, port) : new TcpServerTransport(host, port);
-        await using var server = await MessagingServer.StartAsync(transport, new MessagingServerOptions { Name = "lab-server" });
-        server.PeerConnected += peer => Console.WriteLine($"+ {peer} connected");
-        server.PeerDisconnected += peer => Console.WriteLine($"- {peer} disconnected: {peer.CloseReason}");
-        server.HandlerError += exception => Console.WriteLine($"! handler error: {exception.Message}");
+        await using var server = await MessagingServer.StartAsync(transport, new MessagingServerOptions
+        {
+            Name = "lab-server",
+            Logger = loggerFactory.CreateLogger("Light.Messaging"),
+        });
 
         // Request/response.
         using var pricing = server.Respond<PricingRequest, ForwardPrice>(LabEndpoints.ForwardPricing, (request, _) => new ForwardPrice

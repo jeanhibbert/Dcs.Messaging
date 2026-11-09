@@ -1,4 +1,6 @@
 using Light.Messaging.Internal;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using System;
 
 namespace Light.Messaging;
@@ -13,11 +15,18 @@ public abstract class MessagingOptions
     public IMessageSerializer Serializer { get; set; } = ProtobufNetSerializer.Instance;
 
     /// <summary>
-    /// Frames each connection may have waiting to be sent before <see cref="SlowConsumerPolicy"/> applies.
+    /// Receives connection events (Information), dropped messages from slow consumers and failed reconnects (Warning),
+    /// and handler exceptions (Error). Nothing is logged per message, so logging never touches the hot path.
+    /// </summary>
+    public ILogger Logger { get; set; } = NullLogger.Instance;
+
+    /// <summary>
+    /// Published messages each connection may have waiting to be sent before <see cref="SlowConsumerPolicy"/>
+    /// applies. Responses and control frames are never dropped and do not count towards it.
     /// </summary>
     public int SendQueueCapacity { get; set; } = 65_536;
 
-    public SlowConsumerPolicy SlowConsumerPolicy { get; set; } = SlowConsumerPolicy.Disconnect;
+    public SlowConsumerPolicy SlowConsumerPolicy { get; set; } = SlowConsumerPolicy.DropOldest;
 
     /// <summary>
     /// Largest frame (header plus serialized message) that may be sent or received. Larger incoming frames close the
@@ -58,6 +67,7 @@ public abstract class MessagingOptions
         }
 
         ArgumentNullException.ThrowIfNull(Serializer);
+        ArgumentNullException.ThrowIfNull(Logger);
         return new ConnectionSettings(string.IsNullOrEmpty(Name) ? defaultName : Name, SendQueueCapacity, SlowConsumerPolicy, MaxFrameBytes, SendBatchBytes);
     }
 }
@@ -74,7 +84,26 @@ public sealed class MessagingClientOptions : MessagingOptions
     public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Covers connecting and the protocol handshake.
+    /// Covers connecting and the protocol handshake, for the first connection and every reconnect attempt.
     /// </summary>
     public TimeSpan ConnectTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// After losing the connection, keep trying to reconnect and restore every subscription. The first
+    /// <see cref="MessagingClient.ConnectAsync"/> never retries: a wrong address should fail loudly.
+    /// </summary>
+    public bool AutoReconnect { get; set; } = true;
+
+    /// <summary>
+    /// Wait before the first reconnect attempt; doubles after each failure up to <see cref="ReconnectMaxDelay"/>,
+    /// with ±20% jitter so many clients do not reconnect in lockstep after a server restart.
+    /// </summary>
+    public TimeSpan ReconnectMinDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
+    public TimeSpan ReconnectMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Attempts before giving up, after which <see cref="MessagingClient.Completion"/> completes. 0 means no limit.
+    /// </summary>
+    public int MaxReconnectAttempts { get; set; }
 }

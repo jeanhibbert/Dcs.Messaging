@@ -41,23 +41,38 @@ internal static class Harness
 {
     public static readonly TimeSpan Timeout = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// Reconnect is off unless a test asks for it, so a client whose server shuts down completes instead of retrying.
+    /// </summary>
     public static async Task<(MessagingServer Server, MessagingClient Client)> StartAsync(
         Transport transport,
         MessagingServerOptions? serverOptions = null,
         MessagingClientOptions? clientOptions = null)
     {
         var port = FreePort();
+        var server = await StartServerAsync(transport, port, serverOptions);
+        var client = await MessagingClient.ConnectAsync(
+            ClientTransport(transport, port),
+            clientOptions ?? new MessagingClientOptions { Name = "test-client", AutoReconnect = false });
+        return (server, client);
+    }
+
+    public static async Task<MessagingServer> StartServerAsync(Transport transport, int port, MessagingServerOptions? options = null)
+    {
         ServerTransport serverTransport = transport == Transport.Tcp
             ? new TcpServerTransport("127.0.0.1", port)
             : new GrpcServerTransport("127.0.0.1", port);
-        ClientTransport clientTransport = transport == Transport.Tcp
+
+        var server = await MessagingServer.StartAsync(serverTransport, options);
+        server.Respond<TestMessage, TestMessage>(Endpoints.Ping, (message, _) => message);
+        return server;
+    }
+
+    public static ClientTransport ClientTransport(Transport transport, int port)
+    {
+        return transport == Transport.Tcp
             ? new TcpClientTransport("127.0.0.1", port)
             : new GrpcClientTransport("127.0.0.1", port);
-
-        var server = await MessagingServer.StartAsync(serverTransport, serverOptions);
-        server.Respond<TestMessage, TestMessage>(Endpoints.Ping, (message, _) => message);
-        var client = await MessagingClient.ConnectAsync(clientTransport, clientOptions ?? new MessagingClientOptions { Name = "test-client" });
-        return (server, client);
     }
 
     /// <summary>
@@ -69,13 +84,47 @@ internal static class Harness
         await client.RequestAsync<TestMessage, TestMessage>(Endpoints.Ping, new TestMessage());
     }
 
-    private static int FreePort()
+    public static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + Timeout;
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("Condition not met in time.");
+            }
+
+            await Task.Delay(20);
+        }
+    }
+
+    public static int FreePort()
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
+    }
+}
+
+/// <summary>
+/// Keeps every log entry so tests can assert on warnings.
+/// </summary>
+internal sealed class ListLogger : Microsoft.Extensions.Logging.ILogger
+{
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> _entries = new();
+
+    public IReadOnlyCollection<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> Entries => _entries;
+
+    public IDisposable? BeginScope<TState>(TState state)
+        where TState : notnull => null;
+
+    public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+    public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        _entries.Enqueue((logLevel, formatter(state, exception)));
     }
 }
 

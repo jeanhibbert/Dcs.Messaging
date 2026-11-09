@@ -203,7 +203,7 @@ public sealed class MessagingTests
     [InlineData(Transport.Grpc)]
     public async Task SlowConsumerIsDisconnectedWithoutBlockingThePublisher(Transport transport)
     {
-        var (server, client) = await Harness.StartAsync(transport, new MessagingServerOptions { SendQueueCapacity = 100 });
+        var (server, client) = await Harness.StartAsync(transport, new MessagingServerOptions { SendQueueCapacity = 100, SlowConsumerPolicy = SlowConsumerPolicy.Disconnect });
         await using var _ = server;
         await using var __ = client;
 

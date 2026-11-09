@@ -1,4 +1,5 @@
 using Light.Messaging.Internal;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -9,13 +10,14 @@ namespace Light.Messaging;
 
 /// <summary>
 /// What <see cref="MessagingServer"/> and <see cref="MessagingClient"/> share: subscriptions, dispatch of received
-/// messages, and the watchdog that closes connections whose writes have stalled.
+/// messages, and the watchdog that closes connections whose writes have stalled and reports slow consumers.
 /// </summary>
 public abstract class MessagingSession : IAsyncDisposable
 {
     private readonly object _subscriptionGate = new();
-    private readonly Timer _stallWatchdog;
+    private readonly Timer _watchdog;
     private readonly TimeSpan _sendStallTimeout;
+    private readonly TimeSpan _watchdogPeriod;
 
     // Copy-on-write: received messages are dispatched with one lock-free dictionary lookup.
     private Dictionary<int, Subscription[]> _subscriptions = new();
@@ -24,9 +26,11 @@ public abstract class MessagingSession : IAsyncDisposable
     {
         ConnectionSettings = options.ToConnectionSettings(defaultName);
         Serializer = options.Serializer;
+        Logger = options.Logger;
         ShutdownDrainTimeout = options.ShutdownDrainTimeout;
         _sendStallTimeout = options.SendStallTimeout;
-        _stallWatchdog = new Timer(static state => ((MessagingSession)state).CloseStalledConnections(), this, Timeout.Infinite, Timeout.Infinite);
+        _watchdogPeriod = TimeSpan.FromTicks(Math.Clamp(_sendStallTimeout.Ticks / 4, TimeSpan.TicksPerMillisecond * 100, TimeSpan.TicksPerSecond));
+        _watchdog = new Timer(static state => ((MessagingSession)state).CheckConnections(), this, Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
@@ -40,6 +44,8 @@ public abstract class MessagingSession : IAsyncDisposable
     public IMessageSerializer Serializer { get; }
 
     internal ConnectionSettings ConnectionSettings { get; }
+
+    private protected ILogger Logger { get; }
 
     private protected TimeSpan ShutdownDrainTimeout { get; }
 
@@ -99,12 +105,54 @@ public abstract class MessagingSession : IAsyncDisposable
 
     internal void ReportHandlerError(Exception exception)
     {
+        Logger.LogError(exception, "A message handler threw; the connection stays open");
         try
         {
             HandlerError?.Invoke(exception);
         }
         catch (Exception)
         {
+        }
+    }
+
+    /// <summary>
+    /// Logs messages dropped for <paramref name="connection"/> since the last report. Called by the watchdog and when
+    /// a connection closes, so drops just before a disconnect are not missed.
+    /// </summary>
+    private protected void ReportDrops(Connection connection)
+    {
+        var dropped = connection.TakeUnreportedDrops();
+        if (dropped == 0)
+        {
+            return;
+        }
+
+        Logger.LogWarning(
+            "Slow consumer {Peer}: dropped {Dropped} message(s) in the last {Seconds:0.#} s ({Total} in total), most recently on endpoint {Endpoint}. "
+            + "Its send queue of {Capacity} messages is full: the consumer or the network is not keeping up",
+            connection.Peer,
+            dropped,
+            _watchdogPeriod.TotalSeconds,
+            connection.DroppedFrames,
+            Endpoint.Describe(connection.LastDroppedEndpointId),
+            ConnectionSettings.QueueCapacity);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="swap"/> and then <paramref name="resubscribe"/> for every subscribed endpoint, all under
+    /// the subscription lock, so no Subscribe or Unsubscribe can slip in between. Returns the number of endpoints.
+    /// </summary>
+    private protected int SwapUnderSubscriptionLock(Action swap, Action<int> resubscribe)
+    {
+        lock (_subscriptionGate)
+        {
+            swap();
+            foreach (var endpointId in _subscriptions.Keys)
+            {
+                resubscribe(endpointId);
+            }
+
+            return _subscriptions.Count;
         }
     }
 
@@ -144,11 +192,10 @@ public abstract class MessagingSession : IAsyncDisposable
 
     private protected void StartWatchdog()
     {
-        var period = TimeSpan.FromTicks(Math.Clamp(_sendStallTimeout.Ticks / 4, TimeSpan.TicksPerMillisecond * 100, TimeSpan.TicksPerSecond));
-        _stallWatchdog.Change(period, period);
+        _watchdog.Change(_watchdogPeriod, _watchdogPeriod);
     }
 
-    private protected ValueTask StopWatchdogAsync() => _stallWatchdog.DisposeAsync();
+    private protected ValueTask StopWatchdogAsync() => _watchdog.DisposeAsync();
 
     private void Unsubscribe(Subscription subscription)
     {
@@ -178,13 +225,14 @@ public abstract class MessagingSession : IAsyncDisposable
         }
     }
 
-    private void CloseStalledConnections()
+    private void CheckConnections()
     {
         var now = Stopwatch.GetTimestamp();
         var stallTicks = (long)(_sendStallTimeout.TotalSeconds * Stopwatch.Frequency);
         foreach (var connection in ActiveConnections())
         {
             connection.CloseIfStalled(now, stallTicks);
+            ReportDrops(connection);
         }
     }
 }

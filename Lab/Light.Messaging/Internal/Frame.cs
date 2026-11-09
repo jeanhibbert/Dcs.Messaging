@@ -34,6 +34,10 @@ internal sealed class Frame : IBufferWriter<byte>
 
     public int Length => _length;
 
+    public FrameKind Kind => (FrameKind)_buffer[Wire.LengthSize];
+
+    public int EndpointId => BinaryPrimitives.ReadInt32LittleEndian(_buffer.AsSpan(Wire.LengthSize + 1));
+
     public ReadOnlySpan<byte> Span => new(_buffer, 0, _length);
 
     public ReadOnlyMemory<byte> Memory => new(_buffer, 0, _length);

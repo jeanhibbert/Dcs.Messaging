@@ -46,8 +46,8 @@ flowchart TB
 
 - **`MessagingServer` / `MessagingClient`** hold the routing tables. The server has three: endpoint → subscribed
   peers, endpoint → responder, and the list of peers. The client has its pending requests.
-- **`MessagingSession`** holds local subscriptions, dispatches received publishes to them, and runs the watchdog that
-  closes connections whose writes have stalled.
+- **`MessagingSession`** holds local subscriptions and dispatches received publishes to them. It also runs the
+  watchdog, which closes connections whose writes have stalled and logs slow-consumer warnings.
 - **`Connection`** does everything that doesn't depend on the transport:
   - the outbound queue and the batching send loop
   - frame parsing
@@ -88,9 +88,13 @@ sequenceDiagram
    the header in a pooled buffer. There is no `MemoryStream`, no `ToArray` and no envelope object.
 3. **Share by reference.** The same frame is queued to every subscriber with a reference count. The last `Release`
    returns it to the pool. Pooled frames keep buffers of up to 4 KB; larger buffers go back to `ArrayPool`.
-4. **Enqueue only.** Each peer's queue is a bounded `Channel<Frame>` with `AllowSynchronousContinuations = false`.
-   That setting stops a send loop from ever running on the publisher's thread. `Publish` therefore never touches
-   the network and never waits on a slow peer.
+4. **Enqueue only.** Each peer has a `FrameQueue`: many writers, one reader, first in first out. It wakes the send
+   loop through a reusable `IValueTaskSource`, with continuations on the thread pool, so a send loop never runs on
+   the publisher's thread. `Publish` therefore never touches the network and never waits on a slow peer. Only
+   Publish frames count towards the capacity and only they can be dropped (see
+   [Slow consumers](#slow-consumers-and-flow-control)). That is why this is a custom queue rather than a bounded
+   `Channel`, which would drop the oldest item of any kind. In a microbenchmark, both handle about 16–22M
+   enqueue/dequeue pairs a second.
 5. **Opportunistic batching.** The send loop takes everything already queued and copies it into one pinned 64 KB
    buffer (`SendBatchBytes`), then writes it in one call: one syscall for TCP, one gRPC message for gRPC. It never
    waits for more frames, so a single message goes out alone and immediately, and a burst goes out in large writes.
@@ -136,6 +140,7 @@ sequenceDiagram
 | `RespondAsync` continuations | Wherever the awaited work completes | The receive loop doesn't wait for them; responses can complete out of order. |
 | `RequestAsync` continuation | Thread pool | Never the receive loop, so a slow continuation can't stall reading. |
 | `PeerConnected`, `PeerDisconnected`, `Disconnected` | The connection's receive loop or close path | Keep them short. |
+| `Reconnected` | The client's reconnect task, after subscriptions are restored | Safe to send requests from, for example to fetch a snapshot. |
 
 The rule of thumb: **anything slow in a handler slows only that peer's messages.** If a handler must do real work,
 hand it to your own queue or worker.
@@ -237,17 +242,63 @@ reason recorded wins and is exposed as `Peer.CloseReason`.
 | HTTP/2 PINGs (`KeepAlivePingDelay`) | 10 s | The same, for gRPC |
 | Send-stall watchdog (`SendStallTimeout`) | 5 s | A peer that is connected but has stopped reading |
 
+### Automatic reconnect (client)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connected: ConnectAsync (one attempt, throws on failure)
+    Connected --> Down: connection lost (pending requests fail, Disconnected raised)
+    Down --> Connecting: after backoff with jitter
+    Connecting --> Down: attempt failed (warning logged, delay doubles up to ReconnectMaxDelay)
+    Connecting --> Connected: handshake done, subscriptions restored, Reconnected raised
+    Down --> [*]: disposed, AutoReconnect off, or MaxReconnectAttempts reached (Completion completes)
+```
+
+- **One supervisor task per client.** It runs each connection until it closes, then reconnects. The delay starts at
+  `ReconnectMinDelay` (100 ms) and doubles after each failure up to `ReconnectMaxDelay` (5 s). It carries ±20%
+  jitter, so many clients don't stampede a restarted server.
+- **Subscriptions live in the session, not in the connection, so they survive.** On reconnect, the new connection is
+  swapped in and a Subscribe frame is queued for every subscribed endpoint, both under the subscription lock. A
+  `Subscribe` or `Dispose` that races with the reconnect is therefore never lost or duplicated.
+- **Fail fast while down.** `Publish` and `RequestAsync` throw `MessagingException` ("Not connected, reconnecting")
+  instead of queueing: an order delivered minutes late is worse than one rejected.
+- **In-flight requests fail** with `MessagingException` when the connection drops. Resending is left to the caller,
+  because the server may already have acted on them.
+- **No replay.** Messages the server published during the outage are lost. `Reconnected` is the hook for
+  recovering state, such as requesting a snapshot.
+- **The first `ConnectAsync` makes a single attempt**, so a wrong address or a server that isn't running fails
+  loudly at startup.
+- **Logging.** Each loss is a warning, each failed attempt is a warning with the reason and the next delay, and each
+  success is an information entry with the attempt count and the number of subscriptions restored.
+
 ## Slow consumers and flow control
 
-Every peer has its own queue (`SendQueueCapacity`, default 65,536 frames) and its own send loop. A slow peer can
-therefore fill only its own queue. The publisher and the other peers are never held up. When the queue is full,
-`SlowConsumerPolicy` decides:
+Every peer has its own queue (`SendQueueCapacity`, default 65,536 published messages) and its own send loop. A slow
+peer can therefore fill only its own queue. The publisher and the other peers are never held up. When the queue is
+full of published messages, `SlowConsumerPolicy` decides:
 
 | Policy | Effect | Use for |
 |---|---|---|
-| `Disconnect` (default) | Close the connection with reason "send queue full" | Orders, executions, anything where a silent gap is unacceptable |
-| `DropOldest` | Discard the oldest queued frame | Prices and other state that newer messages supersede |
-| `DropNewest` | Discard the frame being queued | Rarely the right choice; provided for completeness |
+| `DropOldest` (default) | Discard the oldest queued published message to make room | Prices and other state that newer messages supersede |
+| `Disconnect` | Close the connection with reason "send queue full" | Orders, executions, anything where a silent gap is unacceptable |
+| `DropNewest` | Discard the message being published | Rarely the right choice; provided for completeness |
+
+**Only Publish frames are ever dropped.** Responses, error responses, requests and control frames (Hello, Goodbye,
+Subscribe, Unsubscribe) don't count towards the capacity and are always queued, even past it. Dropping one would
+break the protocol: a request would time out for no visible reason, or a subscription would silently never start.
+These frames are rare compared with publishes, and the send-stall watchdog closes a peer that stops reading
+altogether, so the overflow stays small. When the oldest publish sits behind such a frame, it is removed from the
+middle of the queue, and the order of everything else is kept.
+
+**Every drop is counted, and reported as one warning per peer per watchdog check** (about once a second), never one
+log entry per message. The count, the running total and the endpoint are read by the watchdog, off the publishing
+path. A drop just before a disconnect is reported on close. A typical entry:
+
+```
+warn: Light.Messaging[0] Slow consumer lab-client-4242 (127.0.0.1:58021): dropped 48213 message(s) in the last 1 s (112730 in total), most recently on endpoint Lab/Prices. Its send queue of 65536 messages is full: the consumer or the network is not keeping up
+```
+
+`Peer.DroppedFrames` exposes the same total for metrics and alerting.
 
 A publisher that would rather slow down than lose a consumer can watch `Peer.QueuedFrames` and back off. The demo
 server's benchmark keeps each peer below 32,768 queued frames this way, which is why its streaming latency figures
@@ -276,6 +327,11 @@ per-request latency stays about twice TCP's.
 | `TcpSocketOptions.ReceiveBufferBytes` | 256 KB | Very high message rates | Memory per connection matters (thousands of clients) |
 | `TcpSocketOptions.SocketSend/ReceiveBufferBytes` | OS default | High-bandwidth, high-latency links | A slow consumer should be detected before megabytes sit in kernel buffers |
 | `SendStallTimeout` | 5 s | Peers do long GC pauses | Dead peers must be detected faster |
+| `ReconnectMinDelay` / `ReconnectMaxDelay` | 100 ms / 5 s | Many clients share one server, to spread out a reconnect storm | A fast recovery matters more than server load |
+| `MaxReconnectAttempts` | 0 (no limit) | | The process should give up and let a supervisor restart it |
+
+`Logger` takes any `ILogger`. Nothing is logged per message, so a real logging pipeline costs nothing on the hot
+path.
 
 Beyond the library:
 
@@ -310,11 +366,13 @@ These base types are internal, so a transport lives either in `Light.Messaging` 
 
 These are deliberately left out of the bare-bones version, roughly in order of value for a trading system:
 
-1. **Reconnect with resubscribe and sequence-based gap detection**, so a client can recover after a disconnect.
-2. **Per-endpoint slow-consumer policy and conflation** (latest value per key), so prices and orders can share a
-   connection with different guarantees.
+1. **Sequence numbers with gap detection, plus snapshot or replay after a reconnect**, so a client knows exactly
+   what it missed during an outage or a slow-consumer drop.
+2. **Per-endpoint slow-consumer policy and conflation** (latest value per key), so prices (drop oldest) and orders
+   (never drop) can share a connection with different guarantees.
 3. **Lower round-trip latency.** Optionally spin briefly in the send loop before waiting, or use dedicated receive
    threads instead of thread-pool continuations. Each removes a thread-pool wake-up (a few microseconds) per hop, at
    the cost of a busy core per connection.
 4. **Generated serializers.** Google.Protobuf with generated code, or a fixed-layout codec for the hottest messages.
-5. **TLS on the TCP transport**, and authentication in the Hello handshake.
+5. **TLS on the TCP transport**, and authentication in the Hello handshake, if the network can't be trusted. Left
+   out deliberately for latency.

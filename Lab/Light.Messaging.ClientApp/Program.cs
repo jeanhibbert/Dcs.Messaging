@@ -2,6 +2,7 @@ using Light.Messaging.Contracts;
 using Light.Messaging.Grpc;
 using Light.Messaging.Tcp;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
 using System.Linq;
@@ -12,8 +13,9 @@ namespace Light.Messaging.ClientApp;
 
 /// <summary>
 /// Lab client: shows publish/subscribe, request/response and client-to-server publishing against the lab server,
-/// then benchmarks request latency, pipelined request throughput and streaming throughput. Arguments, all optional:
-/// <c>--transport tcp|grpc --host 127.0.0.1 --port 5070 --requests 20000 --burst 2000000</c>.
+/// then benchmarks request latency, pipelined request throughput and streaming throughput. With <c>--watch true</c>
+/// it instead keeps streaming live prices, so you can restart the server and watch the client reconnect. Arguments,
+/// all optional: <c>--transport tcp|grpc --host 127.0.0.1 --port 5070 --requests 20000 --burst 2000000 --watch true</c>.
 /// </summary>
 internal static class Program
 {
@@ -25,15 +27,32 @@ internal static class Program
         var port = settings.GetValue("port", 5070);
         var requests = settings.GetValue("requests", 20_000);
         var burst = settings.GetValue("burst", 2_000_000);
+        var watch = settings.GetValue("watch", false);
+
+        // Disconnects, reconnect attempts and slow-consumer warnings are logged by the library itself.
+        using var loggerFactory = LoggerFactory.Create(logging => logging.AddSimpleConsole(console =>
+        {
+            console.SingleLine = true;
+            console.TimestampFormat = "HH:mm:ss.fff ";
+        }));
 
         ClientTransport transport = useGrpc ? new GrpcClientTransport(host, port) : new TcpClientTransport(host, port);
-        await using var client = await MessagingClient.ConnectAsync(transport, new MessagingClientOptions { Name = $"lab-client-{Environment.ProcessId}" });
-        client.Disconnected += reason => Console.WriteLine($"Disconnected: {reason}");
+        await using var client = await MessagingClient.ConnectAsync(transport, new MessagingClientOptions
+        {
+            Name = $"lab-client-{Environment.ProcessId}",
+            Logger = loggerFactory.CreateLogger("Light.Messaging"),
+        });
         Console.WriteLine($"Connected over {(useGrpc ? "gRPC" : "TCP")} to {client.Server}");
 
         await ShowPublishSubscribeAsync(client);
         await ShowRequestResponseAsync(client);
         ShowClientPublish(client);
+
+        if (watch)
+        {
+            await WatchLivePricesAsync(client);
+            return;
+        }
 
         Console.WriteLine();
         Console.WriteLine("Benchmarks (latency figures assume client and server share a host)");
@@ -80,6 +99,36 @@ internal static class Program
         });
 
         Console.WriteLine("Client publish: trade report sent (see the server console)");
+    }
+
+    /// <summary>
+    /// Prints the live price rate each second. Stop or restart the server: the client logs the disconnect, retries
+    /// with backoff, and once the server is back resubscribes on its own, so the rate recovers with no code here.
+    /// </summary>
+    private static async Task WatchLivePricesAsync(MessagingClient client)
+    {
+        using var stop = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            stop.Cancel();
+        };
+
+        var received = 0;
+        using var prices = client.Subscribe<PriceTick>(LabEndpoints.Prices, _ => Interlocked.Increment(ref received));
+        Console.WriteLine("Watching live prices. Restart the server to see the client reconnect; Ctrl+C to stop.");
+
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(stop.Token))
+            {
+                Console.WriteLine($"  {Interlocked.Exchange(ref received, 0),3} prices/s   {(client.IsConnected ? "connected" : "reconnecting")}");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     /// <summary>
