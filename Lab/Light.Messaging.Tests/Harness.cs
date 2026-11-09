@@ -84,6 +84,18 @@ internal static class Harness
         await client.RequestAsync<TestMessage, TestMessage>(Endpoints.Ping, new TestMessage());
     }
 
+    public static MessagingClientOptions ReconnectingClient(Microsoft.Extensions.Logging.ILogger? logger = null)
+    {
+        return new MessagingClientOptions
+        {
+            Name = "test-client",
+            AutoReconnect = true,
+            ReconnectMinDelay = TimeSpan.FromMilliseconds(20),
+            ReconnectMaxDelay = TimeSpan.FromMilliseconds(200),
+            Logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance,
+        };
+    }
+
     public static async Task WaitUntilAsync(Func<bool> condition)
     {
         var deadline = DateTime.UtcNow + Timeout;

@@ -98,15 +98,14 @@ public sealed class MessagingTests
         var (server, client) = await Harness.StartAsync(transport);
         await using var _ = server;
         await using var __ = client;
-        var reported = new TaskCompletionSource<Exception>();
-        server.HandlerError += exception => reported.TrySetResult(exception);
+        var reported = server.HandlerErrors.FirstAsync().ToTask();
         using var responder = server.Respond<TestMessage, TestMessage>(Endpoints.Fail, (_, _) => throw new InvalidOperationException("no price for EURXYZ"));
 
         var exception = await Assert.ThrowsAsync<RemoteException>(async () =>
             await client.RequestAsync<TestMessage, TestMessage>(Endpoints.Fail, new TestMessage()));
 
         Assert.Equal("no price for EURXYZ", exception.Message);
-        Assert.IsType<InvalidOperationException>(await reported.Task.WaitAsync(Harness.Timeout));
+        Assert.IsType<InvalidOperationException>(await reported.WaitAsync(Harness.Timeout));
         Assert.True(client.IsConnected);
     }
 
@@ -211,20 +210,19 @@ public sealed class MessagingTests
         using var subscription = client.Subscribe<TestMessage>(Endpoints.Events, _ => release.Wait());
         await Harness.BarrierAsync(client);
 
-        var disconnected = new TaskCompletionSource<Peer>();
-        server.PeerDisconnected += peer => disconnected.TrySetResult(peer);
+        var disconnected = server.PeerDisconnected.FirstAsync().ToTask();
 
         // The blocked handler stops the client reading; once the kernel and HTTP/2 buffers fill, the server's
         // 100-frame queue fills and the Disconnect policy closes the connection.
         var payload = new byte[1024];
         var stopwatch = Stopwatch.StartNew();
-        while (!disconnected.Task.IsCompleted && stopwatch.Elapsed < Harness.Timeout)
+        while (!disconnected.IsCompleted && stopwatch.Elapsed < Harness.Timeout)
         {
             server.Publish(Endpoints.Events, new TestMessage { Number = 1, Blob = payload });
         }
 
         release.Set();
-        var peer = await disconnected.Task.WaitAsync(Harness.Timeout);
+        var peer = await disconnected.WaitAsync(Harness.Timeout);
         Assert.Contains("queue full", peer.CloseReason);
         await client.Completion.WaitAsync(Harness.Timeout);
         Assert.False(client.IsConnected);
@@ -265,8 +263,7 @@ public sealed class MessagingTests
 
         const int count = 20_000;
         var received = 0;
-        var disconnected = new TaskCompletionSource<Peer>();
-        server.PeerDisconnected += peer => disconnected.TrySetResult(peer);
+        var disconnected = server.PeerDisconnected.FirstAsync().ToTask();
         using var subscription = server.Subscribe<TestMessage>(Endpoints.FromClient, _ => received++);
 
         for (var i = 0; i < count; i++)
@@ -275,7 +272,7 @@ public sealed class MessagingTests
         }
 
         await client.DisposeAsync();
-        var peer = await disconnected.Task.WaitAsync(Harness.Timeout);
+        var peer = await disconnected.WaitAsync(Harness.Timeout);
 
         Assert.Equal(count, received);
         Assert.Equal("client disposed", peer.CloseReason);

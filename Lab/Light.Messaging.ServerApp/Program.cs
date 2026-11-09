@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
+using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -48,55 +49,37 @@ internal static class Program
             Ask = Math.Round(request.SpotRate + 0.00035, 5),
         });
 
-        // Messages published by clients.
-        using var trades = server.Subscribe<TradeReport>(LabEndpoints.TradeReports, (trade, context) =>
-            Console.WriteLine($"  trade {trade.TradeId} from {context.Sender.Name}: {(trade.IsBuy ? "buy" : "sell")} {trade.Quantity:N0} {trade.CurrencyPair} @ {trade.Price:F5}"));
+        // Messages published by clients, as an Rx stream.
+        using var trades = server.ObserveWithSender<TradeReport>(LabEndpoints.TradeReports).Subscribe(trade =>
+            Console.WriteLine($"  trade {trade.Message.TradeId} from {trade.Sender.Name}: {(trade.Message.IsBuy ? "buy" : "sell")} {trade.Message.Quantity:N0} {trade.Message.CurrencyPair} @ {trade.Message.Price:F5}"));
 
         // Benchmark: published from the thread pool so the requesting client's receive loop is not held up.
         using var bursts = server.RespondAsync<BurstRequest, BurstReply>(LabEndpoints.Burst, (request, context) =>
             new ValueTask<BurstReply>(Task.Run(() => PublishBurst(server, request.Count, context.Sender))));
 
-        using var stop = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) =>
-        {
-            e.Cancel = true;
-            stop.Cancel();
-        };
+        // Ten ticks a second per pair to whichever clients subscribe; costs nothing while nobody does. Rx calls the
+        // handler for one tick at a time, so the random walk needs no locking.
+        var mids = new[] { 1.08450, 1.26530, 151.250 };
+        using var livePrices = Observable.Interval(TimeSpan.FromMilliseconds(100)).Subscribe(sequence => PublishPrices(server, mids, sequence));
 
         Console.WriteLine($"Listening: {(useGrpc ? "gRPC" : "TCP")} on {host}:{port}. Press Ctrl+C to stop.");
-        await PublishLivePricesAsync(server, stop.Token);
+        await CtrlC();
         Console.WriteLine("Stopping: draining client connections");
     }
 
-    /// <summary>
-    /// Ten ticks a second per pair to whichever clients subscribe; costs nothing while nobody does.
-    /// </summary>
-    private static async Task PublishLivePricesAsync(MessagingServer server, CancellationToken cancellationToken)
+    private static void PublishPrices(MessagingServer server, double[] mids, long sequence)
     {
-        var mids = new[] { 1.08450, 1.26530, 151.250 };
-        var sequence = 0L;
-        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
-
-        try
+        for (var i = 0; i < CurrencyPairs.Length; i++)
         {
-            while (await timer.WaitForNextTickAsync(cancellationToken))
+            mids[i] *= 1 + (Random.Shared.NextDouble() - 0.5) * 0.0001;
+            server.Publish(LabEndpoints.Prices, new PriceTick
             {
-                for (var i = 0; i < CurrencyPairs.Length; i++)
-                {
-                    mids[i] *= 1 + (Random.Shared.NextDouble() - 0.5) * 0.0001;
-                    server.Publish(LabEndpoints.Prices, new PriceTick
-                    {
-                        Sequence = ++sequence,
-                        PublishedAt = Stopwatch.GetTimestamp(),
-                        CurrencyPair = CurrencyPairs[i],
-                        Bid = mids[i] - 0.00005,
-                        Ask = mids[i] + 0.00005,
-                    });
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
+                Sequence = sequence * CurrencyPairs.Length + i,
+                PublishedAt = Stopwatch.GetTimestamp(),
+                CurrencyPair = CurrencyPairs[i],
+                Bid = mids[i] - 0.00005,
+                Ask = mids[i] + 0.00005,
+            });
         }
     }
 
@@ -133,5 +116,17 @@ internal static class Program
         }
 
         return new BurstReply { Published = published, ElapsedMilliseconds = stopwatch.Elapsed.TotalMilliseconds };
+    }
+
+    /// <summary>
+    /// Completes on the first Ctrl+C, which is cancelled so the process can shut down cleanly.
+    /// </summary>
+    private static async Task CtrlC()
+    {
+        await Observable.FromEventPattern<ConsoleCancelEventHandler, ConsoleCancelEventArgs>(
+                handler => Console.CancelKeyPress += handler,
+                handler => Console.CancelKeyPress -= handler)
+            .Do(e => e.EventArgs.Cancel = true)
+            .FirstAsync();
     }
 }

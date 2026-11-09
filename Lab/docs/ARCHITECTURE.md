@@ -7,6 +7,7 @@ library, tune it, or add a transport. For usage and benchmark results, see the [
 - [Send path](#send-path)
 - [Receive path](#receive-path)
 - [Threading model](#threading-model)
+- [Reactive Extensions](#reactive-extensions)
 - [Request/response](#requestresponse)
 - [Wire protocol](#wire-protocol)
 - [Connection lifecycle](#connection-lifecycle)
@@ -21,11 +22,12 @@ library, tune it, or add a transport. For usage and benchmark results, see the [
 ```mermaid
 flowchart TB
     subgraph Public["Public API"]
-        Server["MessagingServer<br/>Publish · Subscribe · Respond"]
-        Client["MessagingClient<br/>Publish · Subscribe · RequestAsync"]
+        Server["MessagingServer<br/>Publish · Subscribe/Observe · Respond<br/>PeerConnected · PeerDisconnected"]
+        Client["MessagingClient<br/>Publish · Subscribe/Observe · RequestAsync/Request<br/>Status · Reconnected"]
     end
     subgraph Session["MessagingSession (shared)"]
         Subs["Subscriptions<br/>endpoint id → handlers"]
+        Streams["Rx streams<br/>HandlerErrors · SlowConsumers"]
         Ser["IMessageSerializer"]
     end
     subgraph Conn["Connection (transport-independent)"]
@@ -46,8 +48,9 @@ flowchart TB
 
 - **`MessagingServer` / `MessagingClient`** hold the routing tables. The server has three: endpoint → subscribed
   peers, endpoint → responder, and the list of peers. The client has its pending requests.
-- **`MessagingSession`** holds local subscriptions and dispatches received publishes to them. It also runs the
-  watchdog, which closes connections whose writes have stalled and logs slow-consumer warnings.
+- **`MessagingSession`** holds local subscriptions, dispatches received publishes to them, and turns them into Rx
+  streams on request. It also runs the watchdog, which closes connections whose writes have stalled and reports
+  slow consumers.
 - **`Connection`** does everything that doesn't depend on the transport:
   - the outbound queue and the batching send loop
   - frame parsing
@@ -126,7 +129,8 @@ sequenceDiagram
   `MaxFrameBytes` (default 16 MB) bounds this and rejects corrupt length prefixes.
 - **Dispatch is one dictionary lookup on the endpoint id.** There is no global lock, and no filter is evaluated per
   subscription.
-- **Handler isolation.** A handler that throws raises `HandlerError`. Other handlers and the connection keep going.
+- **Handler isolation.** A handler that throws is reported on `HandlerErrors`. Other handlers and the connection keep
+  going.
 - **gRPC.** Each gRPC message carries whole frames, so the same parser runs over each message's bytes. Batches arrive
   in `ArrayPool` buffers, which are returned once the batch has been processed.
 
@@ -137,13 +141,50 @@ sequenceDiagram
 | `Publish`, `RequestAsync` | Caller's thread | Thread-safe and non-blocking. Messages from one thread to one peer keep their order. |
 | Send loop | Thread pool, one per connection | The only writer to its transport. |
 | Receive loop, `Subscribe` handlers, sync `Respond` handlers | Thread pool, one per connection | Frames from one peer are handled in order, one at a time. Different peers run concurrently. |
+| `Observe` / `ObserveWithSender` observers | The receive loop | As above, and OnNext calls never overlap, even across peers (the server synchronizes the observer). |
 | `RespondAsync` continuations | Wherever the awaited work completes | The receive loop doesn't wait for them; responses can complete out of order. |
 | `RequestAsync` continuation | Thread pool | Never the receive loop, so a slow continuation can't stall reading. |
-| `PeerConnected`, `PeerDisconnected`, `Disconnected` | The connection's receive loop or close path | Keep them short. |
-| `Reconnected` | The client's reconnect task, after subscriptions are restored | Safe to send requests from, for example to fetch a snapshot. |
+| `PeerConnected`, `PeerDisconnected`, `Status` (Reconnecting, Closed) | The connection's receive loop or close path | Keep subscribers short. |
+| `Reconnected`, `Status` (Connected) | The client's reconnect task, after subscriptions are restored | Safe to send requests from, for example to fetch a snapshot. |
+| `SlowConsumers`, request timeouts, backoff | `MessagingOptions.Scheduler` (the thread pool by default) | |
 
 The rule of thumb: **anything slow in a handler slows only that peer's messages.** If a handler must do real work,
-hand it to your own queue or worker.
+hand it to your own queue or worker, or use Rx's `ObserveOn` to move it to another scheduler.
+
+## Reactive Extensions
+
+Rx is the surface for composition and lifecycle. It is not the transport plumbing. The per-message path in
+`Connection` and `DispatchPublish` uses plain delegates, so a message costs no operator chain, subject or lock
+unless the application asks for one. That is the main difference from Dcs.Messaging, which routes every message
+through a synchronized subject and a `Where` filter per subscription.
+
+How each piece is built:
+
+- **`Observe<T>`** is `Observable.Create` over the delegate `Subscribe`, followed by `TakeUntil(stopped)`:
+  - Subscribing an observer registers a subscription, and on the client sends Subscribe to the server.
+  - Disposing it unregisters, and Unsubscribe goes out when it was the last one.
+  - The stream completes when the session is disposed.
+  - On a server, the observer is wrapped in `Observer.Synchronize`, because several receive loops can deliver at once
+    and Rx forbids overlapping OnNext calls. The client has a single receive loop and needs no wrapper.
+- **Lifecycle streams** are subjects:
+  - `PeerConnected`, `PeerDisconnected`, `HandlerErrors` and `SlowConsumers` use `Subject.Synchronize`, since they are
+    raised from many threads.
+  - `Status` is a `BehaviorSubject`, so a new subscriber gets the current state first. `Reconnected` is derived from
+    it: `Status.Skip(1).Where(Connected).Select(Server)`.
+  - Every stream completes on dispose.
+  - An exception thrown by a user's subscriber is caught and reported on `HandlerErrors`, so it can never escape into
+    a receive loop and close a connection.
+- **Logging subscribes to these streams** like any other consumer, so there is one source of truth for what happened.
+- **`Request<TRequest, TResponse>`** is `Observable.FromAsync` over `RequestAsync`. It is cold, so every subscription
+  sends, which is what makes `Retry` and `Timeout` behave correctly. It allocates a `Task` per request; hot paths use
+  `RequestAsync`.
+- **Time** comes from `MessagingOptions.Scheduler`:
+  - the watchdog is `Observable.Interval(period, scheduler)`
+  - request timeouts are an interval checking deadlines measured on `scheduler.Now`
+  - reconnect backoff awaits `Observable.Timer(delay, scheduler)`
+
+  With a `TestScheduler`, tests advance virtual time to trigger timeouts or watchdog reports deterministically (see
+  `ReactiveTests`). Send-stall detection measures real elapsed time with `Stopwatch`, because it is about real I/O.
 
 ## Request/response
 
@@ -164,10 +205,11 @@ sequenceDiagram
 - **Correlation ids** are a per-client 64-bit counter. There are no GUID strings.
 - **Pooled `IValueTaskSource`.** Each request is completed through a pooled `IValueTaskSource<T>`
   (`ManualResetValueTaskSourceCore`), so steady-state requests allocate no `Task` or `TaskCompletionSource`.
-- **Timeouts.** One timer per client checks pending requests every 10 ms. That avoids a timer or
-  `CancellationTokenSource` per request, at the cost of up to 10 ms of slack in when a timeout fires.
+- **Timeouts.** One `Observable.Interval` per client, on the scheduler, checks pending requests every 10 ms against
+  deadlines taken from `scheduler.Now`. That avoids a timer or `CancellationTokenSource` per request, at the cost of
+  up to 10 ms of slack in when a timeout fires.
 - **Errors.** A responder that throws produces an `ErrorResponse` frame carrying the message. The client gets
-  `RemoteException`, and the server raises `HandlerError`. A request to an endpoint with no responder also gets an
+  `RemoteException`, and the server reports the exception on `HandlerErrors`. A request to an endpoint with no responder also gets an
   `ErrorResponse`, so it fails fast rather than timing out.
 - **Close.** When the connection closes, every pending request fails with `MessagingException`.
 - **`RespondAsync`.** A handler that completes synchronously takes the same path as `Respond`. Otherwise the response
@@ -247,10 +289,10 @@ reason recorded wins and is exposed as `Peer.CloseReason`.
 ```mermaid
 stateDiagram-v2
     [*] --> Connected: ConnectAsync (one attempt, throws on failure)
-    Connected --> Down: connection lost (pending requests fail, Disconnected raised)
+    Connected --> Down: connection lost (pending requests fail, Status = Reconnecting)
     Down --> Connecting: after backoff with jitter
     Connecting --> Down: attempt failed (warning logged, delay doubles up to ReconnectMaxDelay)
-    Connecting --> Connected: handshake done, subscriptions restored, Reconnected raised
+    Connecting --> Connected: handshake done, subscriptions restored, Status = Connected (Reconnected emits)
     Down --> [*]: disposed, AutoReconnect off, or MaxReconnectAttempts reached (Completion completes)
 ```
 
@@ -295,10 +337,12 @@ log entry per message. The count, the running total and the endpoint are read by
 path. A drop just before a disconnect is reported on close. A typical entry:
 
 ```
-warn: Light.Messaging[0] Slow consumer lab-client-4242 (127.0.0.1:58021): dropped 48213 message(s) in the last 1 s (112730 in total), most recently on endpoint Lab/Prices. Its send queue of 65536 messages is full: the consumer or the network is not keeping up
+warn: Light.Messaging[0] Slow consumer lab-client-4242 (127.0.0.1:58021): dropped 48213 message(s) since the last report (112730 in total), most recently on endpoint Lab/Prices. Its send queue of 65536 messages is full: the consumer or the network is not keeping up
 ```
 
-`Peer.DroppedFrames` exposes the same total for metrics and alerting.
+Each report is also published on the `SlowConsumers` stream as a `SlowConsumerReport` (peer, dropped, total,
+endpoint), for metrics and alerting; the warning above is just the logger's subscription to it. `Peer.DroppedFrames`
+exposes the running total.
 
 A publisher that would rather slow down than lose a consumer can watch `Peer.QueuedFrames` and back off. The demo
 server's benchmark keeps each peer below 32,768 queued frames this way, which is why its streaming latency figures
@@ -329,6 +373,7 @@ per-request latency stays about twice TCP's.
 | `SendStallTimeout` | 5 s | Peers do long GC pauses | Dead peers must be detected faster |
 | `ReconnectMinDelay` / `ReconnectMaxDelay` | 100 ms / 5 s | Many clients share one server, to spread out a reconnect storm | A fast recovery matters more than server load |
 | `MaxReconnectAttempts` | 0 (no limit) | | The process should give up and let a supervisor restart it |
+| `Scheduler` | `Scheduler.Default` | | Tests: pass a `TestScheduler` to drive timeouts, backoff and the watchdog in virtual time |
 
 `Logger` takes any `ILogger`. Nothing is logged per message, so a real logging pipeline costs nothing on the hot
 path.

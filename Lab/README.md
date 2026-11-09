@@ -5,12 +5,17 @@ protobuf messages between processes on an internal network over **TCP** or **gRP
 Dcs.Messaging users know (named endpoints, publish/subscribe, targeted sends, request/response, protobuf-net DTOs)
 and drops everything that costs time on the hot path.
 
+Like Dcs.Messaging, it presents incoming messages and lifecycle events as **Reactive Extensions** (`IObservable<T>`)
+streams. Unlike Dcs.Messaging, Rx is the composition surface rather than the transport plumbing: the per-message
+path has no Rx operators, subjects or locks unless you choose to use them.
+
 It shares no code with Dcs.Messaging and can live alongside it.
 
 - [Projects](#projects)
 - [Quick start](#quick-start)
 - [Running the demo](#running-the-demo)
 - [API at a glance](#api-at-a-glance)
+- [Reactive Extensions](#reactive-extensions)
 - [Performance](#performance)
 - [Coming from Dcs.Messaging](#coming-from-dcsmessaging)
 - [Limitations](#limitations)
@@ -20,12 +25,12 @@ It shares no code with Dcs.Messaging and can live alongside it.
 
 | Project | What it is | Depends on |
 |---|---|---|
-| `Light.Messaging` | Core: endpoints, serializer, framing, connections, `MessagingServer`, `MessagingClient`, TCP transport | protobuf-net, Microsoft.Extensions.Logging.Abstractions |
+| `Light.Messaging` | Core: endpoints, serializer, framing, connections, `MessagingServer`, `MessagingClient`, TCP transport | protobuf-net, System.Reactive, Microsoft.Extensions.Logging.Abstractions |
 | `Light.Messaging.Grpc` | gRPC transport (`GrpcServerTransport`, `GrpcClientTransport`) on embedded Kestrel | Light.Messaging, ASP.NET Core, Grpc.AspNetCore.Server, Grpc.Net.Client |
 | `Light.Messaging.Contracts` | Demo DTOs and endpoints shared by the two apps | Light.Messaging |
 | `Light.Messaging.ServerApp` | Demo server | Contracts, Grpc |
 | `Light.Messaging.ClientApp` | Demo client and benchmark | Contracts, Grpc |
-| `Light.Messaging.Tests` | Integration tests, every scenario run over both transports | Light.Messaging, Grpc |
+| `Light.Messaging.Tests` | Integration tests over both transports, plus Rx tests using `TestScheduler` | Light.Messaging, Grpc, Microsoft.Reactive.Testing |
 
 gRPC is a separate assembly so that a TCP-only deployment doesn't take a dependency on ASP.NET Core and Kestrel.
 
@@ -56,7 +61,8 @@ await using var server = await MessagingServer.StartAsync(
     new MessagingServerOptions { Name = "pricing-server", Logger = loggerFactory.CreateLogger("Light.Messaging") });
 
 using var pricing = server.Respond<PricingRequest, ForwardPrice>(Endpoints.Pricing, (request, context) => Price(request));
-using var trades = server.Subscribe<TradeReport>(Endpoints.Trades, (trade, context) => Book(trade, context.Sender));
+using var trades = server.ObserveWithSender<TradeReport>(Endpoints.Trades).Subscribe(trade => Book(trade.Message, trade.Sender));
+using var joins = server.PeerConnected.Subscribe(peer => Console.WriteLine($"{peer.Name} joined"));
 
 server.Publish(Endpoints.Prices, tick);                 // every subscribed client
 server.Publish(Endpoints.Prices, tick, somePeer);       // one client
@@ -69,12 +75,16 @@ await using var client = await MessagingClient.ConnectAsync(
     new TcpClientTransport("10.0.0.5", 5070),           // or new GrpcClientTransport("10.0.0.5", 5071)
     new MessagingClientOptions { Name = "trader-ui-7", Logger = loggerFactory.CreateLogger("Light.Messaging") });
 
-using var prices = client.Subscribe<PriceTick>(Endpoints.Prices, tick => Show(tick));
+using var prices = client.Observe<PriceTick>(Endpoints.Prices)
+    .Where(tick => tick.CurrencyPair == "EURUSD")
+    .Sample(TimeSpan.FromMilliseconds(250))             // at most four screen updates a second
+    .Subscribe(Show);
+
 var price = await client.RequestAsync<PricingRequest, ForwardPrice>(Endpoints.Pricing, request);
 client.Publish(Endpoints.Trades, trade);
 
 // Reconnect is automatic and subscriptions are restored. Anything published during the outage is gone, so refresh.
-client.Reconnected += server => RequestSnapshot();
+using var refresh = client.Reconnected.Subscribe(_ => RequestSnapshot());
 ```
 
 ## Running the demo
@@ -85,8 +95,8 @@ dotnet run -c Release --project Lab/Light.Messaging.ClientApp -- --transport tcp
 ```
 
 Use `--transport grpc` on both for gRPC. The client runs these steps:
-1. Subscribes to live prices for a second.
-2. Prices a forward with a request/response call.
+1. Observes live prices for a second, as an Rx stream.
+2. Prices a forward with a request/response call, using the observable `Request` with `Retry`.
 3. Publishes a trade report, which the server logs.
 4. Runs three benchmarks: sequential request latency, pipelined request throughput, and streaming throughput.
 
@@ -97,13 +107,17 @@ rate every second. Stop or restart the server and the client logs the disconnect
 restores its subscription on its own:
 
 ```
-   30 prices/s   connected
-20:17:59.561 warn: Light.Messaging[0] Connection to lab-server ([::ffff:127.0.0.1]:5181) lost (An existing connection was forcibly closed by the remote host.); reconnecting
+   27 prices/s   connected
+20:45:17.406 warn: Light.Messaging[0] Connection to lab-server ([::ffff:127.0.0.1]:5196) lost (An existing connection was forcibly closed by the remote host.); reconnecting
+  status: Reconnecting
     0 prices/s   reconnecting
-20:18:01.697 warn: Light.Messaging[0] Reconnect attempt 1 failed (No connection could be made because the target machine actively refused it.); retrying in about 200 ms
-20:18:02.904 info: Light.Messaging[0] Reconnected to lab-server ([::ffff:127.0.0.1]:5181) after 2 attempt(s); restored 1 subscription(s)
+20:45:19.512 warn: Light.Messaging[0] Reconnect attempt 1 failed (No connection could be made because the target machine actively refused it.); retrying in about 200 ms
+20:45:20.753 info: Light.Messaging[0] Reconnected to lab-server ([::ffff:127.0.0.1]:5196) after 2 attempt(s); restored 1 subscription(s)
+  status: Connected
    30 prices/s   connected
 ```
+
+The rate line is `Observe(...).Buffer(TimeSpan.FromSeconds(1))`, and the status lines come from `client.Status`.
 
 Run the tests with:
 
@@ -116,11 +130,12 @@ dotnet test Lab/Light.Messaging.Tests -c Release
 | Type | Role |
 |---|---|
 | `Endpoint` | Named destination. Only its 32-bit id (FNV-1a of the address) goes on the wire. |
-| `MessagingServer` | `StartAsync`, `Publish` (to subscribers or one peer), `Subscribe`, `Respond` / `RespondAsync`, `Peers`, `PeerConnected` / `PeerDisconnected`. |
-| `MessagingClient` | `ConnectAsync`, `Subscribe`, `Publish`, `RequestAsync`, `Disconnected`, `Reconnected`, `IsConnected`, `Completion`. |
+| `MessagingServer` | `StartAsync`, `Publish` (to subscribers or one peer), `Subscribe`, `Observe` / `ObserveWithSender`, `Respond` / `RespondAsync`, `Peers`; streams `PeerConnected`, `PeerDisconnected`, `HandlerErrors`, `SlowConsumers`. |
+| `MessagingClient` | `ConnectAsync`, `Subscribe`, `Observe`, `Publish`, `RequestAsync` / `Request` (observable), `IsConnected`, `Completion`; streams `Status`, `Reconnected`, `HandlerErrors`, `SlowConsumers`. |
 | `MessageContext` | Passed to handlers; `Sender` is the `Peer` the message came from. |
 | `Peer` | Id, name, address, connection state, close reason, `QueuedFrames` (for flow control), `DroppedFrames`. |
-| `MessagingServerOptions` / `MessagingClientOptions` | Name, `Logger`, serializer, queue capacity, `SlowConsumerPolicy`, frame and batch sizes, timeouts; on the client also `AutoReconnect`, `ReconnectMinDelay`, `ReconnectMaxDelay` and `MaxReconnectAttempts`. |
+| `MessagingServerOptions` / `MessagingClientOptions` | Name, `Logger`, `Scheduler`, serializer, queue capacity, `SlowConsumerPolicy`, frame and batch sizes, timeouts; on the client also `AutoReconnect`, `ReconnectMinDelay`, `ReconnectMaxDelay` and `MaxReconnectAttempts`. |
+| `ConnectionStatus`, `SlowConsumerReport` | What the `Status` and `SlowConsumers` streams carry. |
 | `IMessageSerializer` | Pluggable. `ProtobufNetSerializer` is the default. |
 | `TcpServerTransport` / `TcpClientTransport` | Raw TCP; `SocketOptions` controls buffers and keep-alive. |
 | `GrpcServerTransport` / `GrpcClientTransport` | One bidirectional gRPC stream per client over HTTP/2. |
@@ -136,21 +151,74 @@ Rules worth knowing:
     current.
   - **Only published messages are ever dropped.** Responses, requests and subscribe/unsubscribe frames always get
     through, so a slow consumer never sees a request time out for no reason or a subscription silently fail.
-  - **Drops are logged as one aggregated warning per peer per second**, naming the endpoint, never one line per
-    message. See the [sample warning](docs/ARCHITECTURE.md#slow-consumers-and-flow-control). The running total is
+  - **Drops are reported once per peer per second**, never once per message. Each report is logged as a warning
+    naming the endpoint, and also published on the `SlowConsumers` stream. See the
+    [sample warning](docs/ARCHITECTURE.md#slow-consumers-and-flow-control). The running total is
     `Peer.DroppedFrames`.
   - **`Disconnect`** closes a consumer that can't keep up instead, for streams where gaps are unacceptable.
   - Publishers that would rather throttle can watch `Peer.QueuedFrames`. The demo server does this in its benchmark.
 - **A message object can be reused after `Publish` returns**, because it has already been serialized.
 - **`RequestAsync` returns a pooled `ValueTask`.** Await it exactly once.
 - **Clients reconnect automatically.** After a dropped connection, the client retries with exponential backoff and
-  jitter (100 ms rising to 5 s by default). It restores every subscription, then raises `Reconnected`.
+  jitter (100 ms rising to 5 s by default). It restores every subscription, then publishes `Connected` on `Status`,
+  which also emits on `Reconnected`.
   - While disconnected, `Publish` and `RequestAsync` throw `MessagingException` straight away rather than queueing:
     sending an order minutes late is worse than rejecting it.
   - Requests that were in flight when the connection dropped fail rather than being resent, because the server may
     already have acted on them.
   - Messages published during the outage are not replayed. Use `Reconnected` to refresh state.
   - The first `ConnectAsync` does not retry, so a wrong address fails immediately.
+
+## Reactive Extensions
+
+Everything that happens over time is an `IObservable<T>`:
+
+| Stream | Emits | Completes |
+|---|---|---|
+| `Observe<T>(endpoint)` / `ObserveWithSender<T>(endpoint)` | Each message received on the endpoint (with its sender) | When the session is disposed |
+| `server.PeerConnected` / `server.PeerDisconnected` | Each client as its handshake completes / its connection closes | When the server is disposed |
+| `client.Status` | The current `ConnectionStatus` first, then every change: Connected, Reconnecting, Connected... | With a final Closed |
+| `client.Reconnected` | The new server `Peer` after each reconnect, once subscriptions are restored | With `Status` |
+| `HandlerErrors` | Exceptions thrown by your handlers or Rx subscribers | When the session is disposed |
+| `SlowConsumers` | A `SlowConsumerReport` per peer per watchdog check while messages are being dropped | When the session is disposed |
+| `client.Request<TRequest, TResponse>(...)` | The response, once. Cold: each subscription sends the request, so `.Retry()` and `.Timeout()` behave as expected | After the response |
+
+What the library guarantees:
+
+- **Subscribing is lazy.** An `Observe` stream subscribes on the server when the first observer subscribes. When the
+  last observer goes away (`Dispose`, `Take`, `FirstAsync`, `TakeUntil`...), the server stops sending, and stops
+  serializing the message too if nobody else wants it.
+- **OnNext calls never overlap**, as Rx requires, even on a server receiving from many clients at once.
+- **A failure doesn't end the stream.** A message that fails to deserialize, or a subscriber that throws, is reported
+  on `HandlerErrors`. It does not end a long-lived feed with `OnError`.
+- **The library's own logging is a subscriber** to `PeerConnected`, `PeerDisconnected`, `HandlerErrors` and
+  `SlowConsumers`.
+- **Time runs on `MessagingOptions.Scheduler`.** That covers the watchdog, request timeouts and reconnect backoff.
+  Tests can pass Rx's `TestScheduler` and move time forward instead of waiting: `RequestTimeoutRunsInVirtualTime`
+  checks a 30-second timeout instantly.
+
+When to use which:
+
+- **`Observe`:** for composition (filtering, sampling, buffering, joining streams). Its per-message overhead is one
+  observer call, plus one uncontended lock per message on a server.
+- **`Subscribe`:** keep the delegate form, and `RequestAsync` with its pooled `ValueTask`, for paths that handle
+  millions of messages a second. The demo client's streaming benchmark uses `Subscribe` for this reason, while the
+  rest of the demo uses Rx.
+
+```csharp
+// Fresh prices for one pair, at most four a second, re-priced through the server; retried once on failure.
+using var quotes = client.Observe<PriceTick>(Endpoints.Prices)
+    .Where(tick => tick.CurrencyPair == "EURUSD")
+    .Sample(TimeSpan.FromMilliseconds(250))
+    .SelectMany(tick => client.Request<PricingRequest, ForwardPrice>(Endpoints.Pricing, ToRequest(tick)).Retry(1))
+    .Subscribe(Show);
+
+// Page operations while a consumer is losing messages: the latest report per consumer, at most once a minute.
+using var alerts = server.SlowConsumers
+    .GroupBy(report => report.Peer)
+    .SelectMany(perPeer => perPeer.Sample(TimeSpan.FromMinutes(1)))
+    .Subscribe(report => PageOperations(report));
+```
 
 ## Performance
 
@@ -178,7 +246,7 @@ Where the gains come from (details in [the architecture document](docs/ARCHITECT
 | Sending | Thread-pool hop and blocking socket write per message, behind a lock | **Enqueue only**; a writer loop per peer batches everything queued into one write |
 | Fan-out | Every message to every connection, re-encoded per send | **Only to subscribed peers, serialized once**, shared by reference; nothing serialized when nobody subscribes |
 | Slow subscriber | Stalls the broadcast loop and the thread pool | **Affects only itself**; bounded queue, drop-oldest, aggregated warning |
-| Receive | Global lock, `Where` filter per subscription per message | **Lookup table, no lock**; decoded straight from the receive buffer |
+| Receive | Global lock, `Where` filter per subscription per message | **Lookup table, no lock**; decoded straight from the receive buffer; Rx only where you compose |
 | Request/response | GUID strings, Rx pipeline, `Task` per request | **64-bit correlation id, pooled `ValueTask` source** |
 | Allocation | `MemoryStream` + `ToArray` + envelope per message | **Pooled frames and buffers**; the serializer writes into the frame |
 
@@ -190,9 +258,9 @@ Where the gains come from (details in [the architecture document](docs/ARCHITECT
 | `TcpMessagingSessionBuilder` / `GrpcMessagingSessionBuilder` | `MessagingServer.StartAsync(transport)` / `MessagingClient.ConnectAsync(transport)` |
 | `IMessagingService.Send(message, endpoint)` | `server.Publish(endpoint, dto)` / `client.Publish(endpoint, dto)` |
 | `Send(..., targetSessionId)` | `server.Publish(endpoint, dto, peer)` |
-| `GetMessageStream(endpoint)` + Rx `Subscribe` | `Subscribe<T>(endpoint, handler)` returns `IDisposable` |
+| `GetMessageStream(endpoint)` + Rx `Subscribe` | `Observe<T>(endpoint)` returns `IObservable<T>` directly; or `Subscribe<T>(endpoint, handler)` on hot paths |
 | `IRequestResponder.GetRespondableRequestStream` + `Respond` | `server.Respond<TRequest, TResponse>(endpoint, handler)` |
-| Hand-rolled correlation id, `Where` and `Take(1)` on the response stream | `await client.RequestAsync<TRequest, TResponse>(endpoint, request)` |
+| Hand-rolled correlation id, `Where` and `Take(1)` on the response stream | `await client.RequestAsync<TRequest, TResponse>(endpoint, request)`, or `client.Request(...)` as an observable |
 | `IBinarySerializer` (`byte[]` in and out) | `IMessageSerializer` (writes to `IBufferWriter<byte>`, reads from `ReadOnlySpan<byte>`) |
 | `SenderSessionId` (string) | `MessageContext.Sender` (`Peer`) |
 | TTL, persistence and arbitrary message properties | Not carried. Put what you need in the DTO. |

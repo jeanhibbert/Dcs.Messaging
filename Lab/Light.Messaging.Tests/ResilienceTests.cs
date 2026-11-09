@@ -58,7 +58,7 @@ public sealed class ResilienceTests
     [InlineData(Transport.Grpc)]
     public async Task ClientReconnectsAndRestoresSubscriptionsWhenTheConnectionDrops(Transport transport)
     {
-        var (server, client) = await Harness.StartAsync(transport, clientOptions: ReconnectingClient());
+        var (server, client) = await Harness.StartAsync(transport, clientOptions: Harness.ReconnectingClient());
         await using var _ = server;
         await using var __ = client;
 
@@ -66,14 +66,10 @@ public sealed class ResilienceTests
         using var subscription = client.Subscribe<TestMessage>(Endpoints.Events, message => received.TrySetResult(message.Number));
         await Harness.BarrierAsync(client);
 
-        var disconnected = new TaskCompletionSource<string>();
-        var reconnected = new TaskCompletionSource<Peer>();
-        client.Disconnected += reason => disconnected.TrySetResult(reason);
-        client.Reconnected += peer => reconnected.TrySetResult(peer);
+        var reconnected = client.Reconnected.FirstAsync().ToTask();
 
         server.Peers.Single().Connection.Close("killed by the test");
-        await disconnected.Task.WaitAsync(Harness.Timeout);
-        await reconnected.Task.WaitAsync(Harness.Timeout);
+        await reconnected.WaitAsync(Harness.Timeout);
 
         // The barrier returns only after the server has processed the restored subscription.
         await Harness.BarrierAsync(client);
@@ -91,19 +87,17 @@ public sealed class ResilienceTests
         var port = Harness.FreePort();
         var logger = new ListLogger();
         var server = await Harness.StartServerAsync(transport, port);
-        await using var client = await MessagingClient.ConnectAsync(Harness.ClientTransport(transport, port), ReconnectingClient(logger));
+        await using var client = await MessagingClient.ConnectAsync(Harness.ClientTransport(transport, port), Harness.ReconnectingClient(logger));
 
         var received = new TaskCompletionSource<int>();
         using var subscription = client.Subscribe<TestMessage>(Endpoints.Events, message => received.TrySetResult(message.Number));
         await Harness.BarrierAsync(client);
 
-        var disconnected = new TaskCompletionSource<string>();
-        var reconnected = new TaskCompletionSource<Peer>();
-        client.Disconnected += reason => disconnected.TrySetResult(reason);
-        client.Reconnected += peer => reconnected.TrySetResult(peer);
+        var lost = client.Status.Skip(1).FirstAsync().ToTask();
+        var reconnected = client.Reconnected.FirstAsync().ToTask();
 
         await server.DisposeAsync();
-        Assert.Equal("server shutting down", await disconnected.Task.WaitAsync(Harness.Timeout));
+        Assert.Equal(new ConnectionStatus(ConnectionState.Reconnecting, client.Server, "server shutting down"), await lost.WaitAsync(Harness.Timeout));
 
         // Down: requests and publishes are refused at once rather than queued.
         var refused = await Assert.ThrowsAsync<MessagingException>(async () => await client.RequestAsync<TestMessage, TestMessage>(Endpoints.Ping, new TestMessage()));
@@ -112,23 +106,11 @@ public sealed class ResilienceTests
         await Harness.WaitUntilAsync(() => logger.Entries.Any(entry => entry.Level == LogLevel.Warning && entry.Message.Contains("Reconnect attempt")));
 
         await using var restarted = await Harness.StartServerAsync(transport, port);
-        await reconnected.Task.WaitAsync(Harness.Timeout);
+        await reconnected.WaitAsync(Harness.Timeout);
         await Harness.BarrierAsync(client);
         restarted.Publish(Endpoints.Events, new TestMessage { Number = 9 });
 
         Assert.Equal(9, await received.Task.WaitAsync(Harness.Timeout));
         Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Information && entry.Message.Contains("restored 1 subscription"));
-    }
-
-    private static MessagingClientOptions ReconnectingClient(ILogger? logger = null)
-    {
-        return new MessagingClientOptions
-        {
-            Name = "test-client",
-            AutoReconnect = true,
-            ReconnectMinDelay = TimeSpan.FromMilliseconds(20),
-            ReconnectMaxDelay = TimeSpan.FromMilliseconds(200),
-            Logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance,
-        };
     }
 }

@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Concurrent;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Sources;
 
@@ -136,7 +135,7 @@ internal sealed class Responder<TRequest, TResponse> : Responder
 internal abstract class PendingRequest
 {
     /// <summary>
-    /// <see cref="System.Diagnostics.Stopwatch"/> timestamp after which the request times out.
+    /// UTC ticks on the session's scheduler clock after which the request times out.
     /// </summary>
     public long Deadline { get; protected set; }
 
@@ -211,20 +210,5 @@ internal sealed class PendingRequest<T> : PendingRequest, IValueTaskSource<T>
     public void OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
     {
         _core.OnCompleted(continuation, state, token, flags);
-    }
-}
-
-internal sealed class DisposableAction : IDisposable
-{
-    private Action _action;
-
-    public DisposableAction(Action action)
-    {
-        _action = action;
-    }
-
-    public void Dispose()
-    {
-        Interlocked.Exchange(ref _action, null)?.Invoke();
     }
 }

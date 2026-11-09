@@ -2,6 +2,7 @@ using Light.Messaging.Internal;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System;
+using System.Reactive.Concurrency;
 
 namespace Light.Messaging;
 
@@ -19,6 +20,12 @@ public abstract class MessagingOptions
     /// and handler exceptions (Error). Nothing is logged per message, so logging never touches the hot path.
     /// </summary>
     public ILogger Logger { get; set; } = NullLogger.Instance;
+
+    /// <summary>
+    /// Clock and timers for the watchdog, request timeouts and reconnect backoff. Tests can pass Rx's
+    /// <c>TestScheduler</c> to drive these in virtual time instead of waiting.
+    /// </summary>
+    public IScheduler Scheduler { get; set; } = System.Reactive.Concurrency.Scheduler.Default;
 
     /// <summary>
     /// Published messages each connection may have waiting to be sent before <see cref="SlowConsumerPolicy"/>
@@ -68,6 +75,7 @@ public abstract class MessagingOptions
 
         ArgumentNullException.ThrowIfNull(Serializer);
         ArgumentNullException.ThrowIfNull(Logger);
+        ArgumentNullException.ThrowIfNull(Scheduler);
         return new ConnectionSettings(string.IsNullOrEmpty(Name) ? defaultName : Name, SendQueueCapacity, SlowConsumerPolicy, MaxFrameBytes, SendBatchBytes);
     }
 }

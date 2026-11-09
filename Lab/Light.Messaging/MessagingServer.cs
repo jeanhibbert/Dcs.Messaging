@@ -5,6 +5,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -15,6 +18,7 @@ namespace Light.Messaging;
 /// <code>
 /// await using var server = await MessagingServer.StartAsync(new TcpServerTransport("0.0.0.0", 5070));
 /// using var pricing = server.Respond&lt;PricingRequest, ForwardPrice&gt;(Endpoints.Pricing, (request, context) => Price(request));
+/// using var trades = server.ObserveWithSender&lt;TradeReport&gt;(Endpoints.Trades).Subscribe(trade => Book(trade.Message, trade.Sender));
 /// server.Publish(Endpoints.Prices, tick);
 /// </code>
 /// </summary>
@@ -25,6 +29,10 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
     private readonly object _gate = new();
     private readonly ServerTransport _transport;
     private readonly ConcurrentDictionary<Connection, Task> _running = new();
+
+    // Raised from many receive loops at once, so synchronized to keep Rx's one-OnNext-at-a-time rule.
+    private readonly ISubject<Peer> _peerConnected = Subject.Synchronize(new Subject<Peer>());
+    private readonly ISubject<Peer> _peerDisconnected = Subject.Synchronize(new Subject<Peer>());
 
     // Copy-on-write maps, read without locks on every publish and request.
     private Dictionary<int, Connection[]> _interest = new();
@@ -37,13 +45,23 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
         : base(options, "server")
     {
         _transport = transport;
+        DisposeWithSession(_peerConnected.Subscribe(peer => Logger.LogInformation("Peer {Peer} connected", peer)));
+        DisposeWithSession(_peerDisconnected.Subscribe(peer => Logger.LogInformation("Peer {Peer} disconnected: {Reason}", peer, peer.CloseReason)));
     }
 
-    public event Action<Peer> PeerConnected;
+    /// <summary>
+    /// Each client once its handshake completes. Completes when the server is disposed.
+    /// </summary>
+    public IObservable<Peer> PeerConnected => _peerConnected.AsObservable();
 
-    public event Action<Peer> PeerDisconnected;
+    /// <summary>
+    /// Each client once its connection has closed; <see cref="Peer.CloseReason"/> says why.
+    /// </summary>
+    public IObservable<Peer> PeerDisconnected => _peerDisconnected.AsObservable();
 
     public IReadOnlyList<Peer> Peers => Volatile.Read(ref _peers);
+
+    private protected override bool DispatchesConcurrently => true;
 
     ConnectionSettings IConnectionHost.ConnectionSettings => ConnectionSettings;
 
@@ -133,8 +151,6 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
             _disposed = true;
         }
 
-        await StopWatchdogAsync().ConfigureAwait(false);
-
         foreach (var connection in _running.Keys)
         {
             connection.Shutdown("server shutting down");
@@ -151,16 +167,17 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
 
         await running.ConfigureAwait(false);
         await _transport.DisposeAsync().ConfigureAwait(false);
+
+        _peerConnected.OnCompleted();
+        _peerDisconnected.OnCompleted();
+        StopSession();
     }
 
     Task IConnectionHost.RunConnectionAsync(Connection connection)
     {
         connection.Id = Interlocked.Increment(ref _nextPeerId);
-        var run = connection.RunAsync(this);
-        _running[connection] = run;
-        _ = run.ContinueWith(_ => _running.TryRemove(connection, out _), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         _ = CloseIfNoHandshakeAsync(connection);
-        return run;
+        return TrackAsync(connection);
     }
 
     void IConnectionOwner.OnConnected(Connection connection)
@@ -176,8 +193,7 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
             _peers = [.. _peers, connection.Peer];
         }
 
-        Logger.LogInformation("Peer {Peer} connected", connection.Peer);
-        PeerConnected?.Invoke(connection.Peer);
+        Notify(_peerConnected, connection.Peer);
     }
 
     void IConnectionOwner.OnFrame(Connection connection, FrameKind kind, int endpointId, long correlationId, ReadOnlySpan<byte> payload)
@@ -240,8 +256,7 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
         }
 
         ReportDrops(connection);
-        Logger.LogInformation("Peer {Peer} disconnected: {Reason}", connection.Peer, connection.CloseReason);
-        PeerDisconnected?.Invoke(connection.Peer);
+        Notify(_peerDisconnected, connection.Peer);
     }
 
     internal static void SendError(Connection connection, int endpointId, long correlationId, string message)
@@ -253,6 +268,20 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
     }
 
     private protected override IEnumerable<Connection> ActiveConnections() => Volatile.Read(ref _peers).Select(peer => peer.Connection);
+
+    private async Task TrackAsync(Connection connection)
+    {
+        var run = connection.RunAsync(this);
+        _running[connection] = run;
+        try
+        {
+            await run.ConfigureAwait(false);
+        }
+        finally
+        {
+            _running.TryRemove(connection, out _);
+        }
+    }
 
     /// <summary>
     /// A socket that connects but never says Hello would otherwise hold its resources forever.
@@ -281,7 +310,7 @@ public sealed class MessagingServer : MessagingSession, IConnectionOwner, IConne
             Volatile.Write(ref _responders, new Dictionary<int, Responder>(_responders) { [responder.Endpoint.Id] = responder });
         }
 
-        return new DisposableAction(() =>
+        return Disposable.Create(() =>
         {
             lock (_gate)
             {

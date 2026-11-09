@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
 using System.Linq;
+using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -61,28 +62,28 @@ internal static class Program
         await MeasureBurstAsync(client, burst);
     }
 
+    /// <summary>
+    /// Live prices as an Rx stream: print the first three, count a second's worth. Each query subscribes on its own
+    /// and unsubscribes when it completes; the server stops sending once neither is listening.
+    /// </summary>
     private static async Task ShowPublishSubscribeAsync(MessagingClient client)
     {
-        var received = 0;
-        using (client.Subscribe<PriceTick>(LabEndpoints.Prices, tick =>
-        {
-            if (Interlocked.Increment(ref received) <= 3)
-            {
-                Console.WriteLine($"  price {tick.CurrencyPair} {tick.Bid:F5} / {tick.Ask:F5}");
-            }
-        }))
-        {
-            await Task.Delay(TimeSpan.FromSeconds(1));
-        }
+        var prices = client.Observe<PriceTick>(LabEndpoints.Prices);
 
-        Console.WriteLine($"Publish/subscribe: {received} live prices in 1 s");
+        using var firstThree = prices.Take(3).Subscribe(tick => Console.WriteLine($"  price {tick.CurrencyPair} {tick.Bid:F5} / {tick.Ask:F5}"));
+        var count = await prices.Take(TimeSpan.FromSeconds(1)).Count();
+
+        Console.WriteLine($"Publish/subscribe: {count} live prices in 1 s");
     }
 
+    /// <summary>
+    /// The observable form of a request; it composes with Rx, here retrying once if the first attempt fails.
+    /// </summary>
     private static async Task ShowRequestResponseAsync(MessagingClient client)
     {
-        var price = await client.RequestAsync<PricingRequest, ForwardPrice>(
-            LabEndpoints.ForwardPricing,
-            new PricingRequest { CurrencyPair = "EURUSD", Tenor = "3M", SpotRate = 1.08452 });
+        var price = await client
+            .Request<PricingRequest, ForwardPrice>(LabEndpoints.ForwardPricing, new PricingRequest { CurrencyPair = "EURUSD", Tenor = "3M", SpotRate = 1.08452 })
+            .Retry(2);
 
         Console.WriteLine($"Request/response: {price.CurrencyPair} {price.Tenor} forward {price.Bid:F5} / {price.Ask:F5}");
     }
@@ -107,28 +108,19 @@ internal static class Program
     /// </summary>
     private static async Task WatchLivePricesAsync(MessagingClient client)
     {
-        using var stop = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) =>
-        {
-            e.Cancel = true;
-            stop.Cancel();
-        };
-
-        var received = 0;
-        using var prices = client.Subscribe<PriceTick>(LabEndpoints.Prices, _ => Interlocked.Increment(ref received));
         Console.WriteLine("Watching live prices. Restart the server to see the client reconnect; Ctrl+C to stop.");
 
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
-        try
-        {
-            while (await timer.WaitForNextTickAsync(stop.Token))
-            {
-                Console.WriteLine($"  {Interlocked.Exchange(ref received, 0),3} prices/s   {(client.IsConnected ? "connected" : "reconnecting")}");
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
+        using var rate = client.Observe<PriceTick>(LabEndpoints.Prices)
+            .Buffer(TimeSpan.FromSeconds(1))
+            .Subscribe(second => Console.WriteLine($"  {second.Count,3} prices/s   {(client.IsConnected ? "connected" : "reconnecting")}"));
+
+        using var status = client.Status.Skip(1).Subscribe(change => Console.WriteLine($"  status: {change.State}"));
+
+        await Observable.FromEventPattern<ConsoleCancelEventHandler, ConsoleCancelEventArgs>(
+                handler => Console.CancelKeyPress += handler,
+                handler => Console.CancelKeyPress -= handler)
+            .Do(e => e.EventArgs.Cancel = true)
+            .FirstAsync();
     }
 
     /// <summary>
@@ -184,6 +176,7 @@ internal static class Program
         long firstAt = 0;
         long lastAt = 0;
 
+        // Millions of messages: the delegate Subscribe is the hot path, with no Rx operator per message.
         using var subscription = client.Subscribe<PriceTick>(LabEndpoints.BurstTicks, tick =>
         {
             var now = Stopwatch.GetTimestamp();
