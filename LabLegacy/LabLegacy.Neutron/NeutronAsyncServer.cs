@@ -80,6 +80,11 @@ public sealed class NeutronAsyncServer<T> : INeutronAsyncServer<T>
 
     public void Stop()
     {
+        if (_listener == null)
+        {
+            return;
+        }
+
         _log.LogInformation("Stopping Neutron Listener");
         _cts?.Cancel();
         _listener?.Dispose();
