@@ -7,6 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\LabLegacy.Neutron\LabLegacy.Neutron.csproj" />
     <ProjectReference Include="..\LabLegacy.Neutron.SampleMessages\LabLegacy.Neutron.SampleMessages.csproj" />
   </ItemGroup>
 </Project>

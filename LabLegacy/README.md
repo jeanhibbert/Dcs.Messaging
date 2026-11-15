@@ -4,18 +4,43 @@ A modernised version of a legacy TCP/protobuf server and its per-client connecti
 `NeutronAsyncServer<T>` and `NeutronClientConnection<T>`. The public members and events are the same as the
 originals, and so is the wire format, so existing clients connect unchanged.
 
-For how it works inside (wire format, send and receive paths, threading, connection lifecycle), see
+It also has a client the legacy code did not: `NeutronClient<T>`, which reconnects automatically when the server
+stops and starts, and reports through Reactive Extensions observables instead of events.
+
+For how it works inside (wire format, send and receive paths, threading, connection lifecycle, reconnecting), see
 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 ## Projects
 
 | Project | What it is |
 |---|---|
-| `LabLegacy.Neutron` | The library: `NeutronAsyncServer<T>`, `NeutronClientConnection<T>` and their contracts. |
-| `LabLegacy.Neutron.Tests` | Tests, with a legacy-style client on the other end of every connection. |
+| `LabLegacy.Neutron` | The library: `NeutronAsyncServer<T>`, `NeutronClientConnection<T>`, `NeutronClient<T>` and their contracts. |
+| `LabLegacy.Neutron.Tests` | Server tests with a legacy-style client on the other end, and client tests against the real server. |
 | `LabLegacy.Neutron.SampleMessages` | The message type the two samples share. |
 | `LabLegacy.Neutron.SampleServer` | Sample server: heartbeats, a price broadcast, and an acknowledgement for each order. |
-| `LabLegacy.Neutron.SampleClient` | Sample client written the way a legacy client is, with a pass/fail check at the end. |
+| `LabLegacy.Neutron.SampleClient` | Sample client built on `NeutronClient<T>`, with a pass/fail check at the end. |
+
+## Using the client
+
+```csharp
+using var client = new NeutronClient<SampleMessage>(new NeutronClientConfig
+{
+    ServerAddress = new IPEndPoint(IPAddress.Loopback, 5080),
+    HeartBeatTimeout = TimeSpan.FromSeconds(6),   // a few times the server's heartbeat interval
+});
+
+client.Messages.Where(message => message.Kind == SampleMessageKind.Price).Subscribe(HandlePrice);
+client.State.Subscribe(state => Console.WriteLine(state));      // Disconnected, Connecting, Connected
+client.Errors.Subscribe(error => Console.WriteLine(error.Message));
+
+client.Start();
+client.SendMessage(order);   // false while there is no connection
+```
+
+- It reconnects with a backoff (100 ms doubling to 5 s) for as long as it is not disposed.
+- Nothing is replayed after a reconnect. Subscribe to `State` and send whatever the server needs again each time
+  it becomes `Connected`.
+- With `HeartBeatTimeout` set, a server that goes silent without closing the socket is also detected.
 
 ## Running the samples
 
@@ -24,40 +49,58 @@ seconds to run:
 
 ```powershell
 dotnet run -c Release --project LabLegacy/LabLegacy.Neutron.SampleServer -- 5080
-dotnet run -c Release --project LabLegacy/LabLegacy.Neutron.SampleClient -- 5080 5
+dotnet run -c Release --project LabLegacy/LabLegacy.Neutron.SampleClient -- 5080 12
 ```
 
 The server heartbeats every 2 seconds, broadcasts a price twice a second, and acknowledges each order to the client
-that sent it. The client sends three orders, listens for 5 seconds, and checks what it received. Its exit code is 0
-when every check passes:
+that sent it. The client sends three orders each time it connects, listens for the given time, and checks what it
+received. Its exit code is 0 when every check passes.
+
+This is the client's output from a run in which the server was stopped after 4 seconds and started again 2.5
+seconds later:
 
 ```
-Connected to 127.0.0.1:5281
-Sent 3 orders; listening for 5 s
+[Disconnected]
+[Connecting]
+[Connected]
+  sent 3 orders
   order #1 accepted
-  price #1 EURUSD 1.08474
   order #2 accepted
   order #3 accepted
-  price #2 EURUSD 1.08530
-  price #3 EURUSD 1.08547
+  price #2 EURUSD 1.08547
+  price #3 EURUSD 1.08525
+  heartbeat
+  price #4 EURUSD 1.08487
+  heartbeat
+[Connecting]
+  ! No connection could be made because the target machine actively refused it.
+[Connected]
+  sent 3 orders
+  order #1 accepted
+  order #2 accepted
+  order #3 accepted
   heartbeat
   heartbeat
+  heartbeat
+[Disconnected]
 
+PASS  connected (2 times)
 PASS  every order acknowledged (3/3)
-PASS  prices received (10) and in order
-PASS  heartbeats received (2)
+PASS  prices received (19) and in order
+PASS  heartbeats received (5)
 ```
 
-The server's side of the same run:
+The restarted server's side of the same run:
 
 ```
 info: LabLegacy.Neutron.NeutronAsyncServer[0] Starting Neutron Listener on 127.0.0.1:5281
-+ client connected: 1d6aaa60-be22-4854-86e9-111d1a2d0a70_127.0.0.1:55714
+Listening on 127.0.0.1:5281. Press Ctrl+C to stop.
++ client connected: 60053610-80de-43b7-8f31-b06741388981_127.0.0.1:58784
   order #1 buy 1M EURUSD @ 1.08460
   order #2 buy 1M EURUSD @ 1.08470
   order #3 buy 1M EURUSD @ 1.08480
-info: LabLegacy.Neutron.NeutronAsyncServer[0] connection_id:1d6aaa60-be22-4854-86e9-111d1a2d0a70_127.0.0.1:55714 has stopped
-- client disconnected: 1d6aaa60-be22-4854-86e9-111d1a2d0a70_127.0.0.1:55714
+info: LabLegacy.Neutron.NeutronAsyncServer[0] connection_id:60053610-80de-43b7-8f31-b06741388981_127.0.0.1:58784 has stopped
+- client disconnected: 60053610-80de-43b7-8f31-b06741388981_127.0.0.1:58784
 ```
 
 ## Wire format (unchanged)
@@ -70,7 +113,7 @@ Serializer.SerializeWithLengthPrefix(stream, message, PrefixStyle.Base128);
 Serializer.DeserializeWithLengthPrefix<T>(stream, PrefixStyle.Base128);
 ```
 
-The tests use those two calls as the client, so they prove compatibility in both directions.
+The server tests use those two calls as the client, so they prove compatibility in both directions.
 
 ## What changed and why
 
@@ -121,7 +164,17 @@ Other differences from the original:
 dotnet test LabLegacy/LabLegacy.Neutron.Tests -c Release
 ```
 
-They cover:
+The client tests cover:
+
+- messages in both directions, in order
+- 4 concurrent senders with no corruption
+- the sequence of states, and completion on dispose
+- reconnecting after the server stops and starts again on the same port
+- retrying, with each failure reported, until a server appears
+- a silent connection being replaced after the heartbeat timeout
+- heartbeats keeping a connection alive
+
+The server tests cover:
 
 - ordering of messages from a client
 - broadcast and targeted sends

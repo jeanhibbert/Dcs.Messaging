@@ -1,77 +1,80 @@
+using LabLegacy.Neutron;
 using LabLegacy.Neutron.SampleMessages;
-using ProtoBuf;
-using System.Net.Sockets;
+using System.Net;
+using System.Reactive.Linq;
 
-// Sample client. It talks to the server exactly as an existing legacy client does: protobuf-net's length-prefixed
-// stream calls over a TcpClient. It sends three orders, listens for a few seconds, and checks that it received an
-// acknowledgement for each order plus prices and heartbeats. Exit code 0 means everything arrived.
+// Sample client built on NeutronClient<T>. Each time it connects it sends three orders; it prints what the server
+// sends back, and after a few seconds checks that it received an acknowledgement for each order plus prices and
+// heartbeats. Exit code 0 means everything arrived. Stop and restart the server while it runs to watch it reconnect.
 // Usage: SampleClient [port] [seconds]   (defaults: 5080, 5)
 var port = args.Length > 0 ? int.Parse(args[0]) : 5080;
 var listenFor = TimeSpan.FromSeconds(args.Length > 1 ? int.Parse(args[1]) : 5);
 const int orderCount = 3;
 
-using var tcpClient = new TcpClient { NoDelay = true };
-await tcpClient.ConnectAsync("127.0.0.1", port);
-var stream = tcpClient.GetStream();
-Console.WriteLine($"Connected to 127.0.0.1:{port}");
+var client = new NeutronClient<SampleMessage>(new NeutronClientConfig
+{
+    ServerAddress = new IPEndPoint(IPAddress.Loopback, port),
+
+    // The server heartbeats every 2 s; three missed heartbeats mean the connection is dead.
+    HeartBeatTimeout = TimeSpan.FromSeconds(6),
+});
 
 var prices = 0;
 var heartBeats = 0;
+var connections = 0;
 var acknowledged = new HashSet<long>();
 long lastPriceSequence = 0;
 var pricesInOrder = true;
 
-// Reads until the connection is closed, which the main thread does when the listening time is up.
-var reading = Task.Run(() =>
+client.State.Subscribe(state => Console.WriteLine($"[{state}]"));
+client.Errors.Subscribe(error => Console.WriteLine($"  ! {error.Message}"));
+
+// Nothing is replayed after a reconnect, so whatever the server needs is sent again on every connection.
+client.State.Where(state => state == NeutronClientState.Connected).Subscribe(_ =>
 {
-    try
+    connections++;
+    lastPriceSequence = 0;
+    for (var i = 1; i <= orderCount; i++)
     {
-        while (Serializer.DeserializeWithLengthPrefix<SampleMessage>(stream, PrefixStyle.Base128) is { } message)
-        {
-            switch (message.Kind)
-            {
-                case SampleMessageKind.Price:
-                    pricesInOrder &= message.Sequence > lastPriceSequence;
-                    lastPriceSequence = message.Sequence;
-                    if (++prices <= 3)
-                    {
-                        Console.WriteLine($"  price #{message.Sequence} {message.Symbol} {message.Price:F5}");
-                    }
-
-                    break;
-
-                case SampleMessageKind.OrderAck:
-                    acknowledged.Add(message.Sequence);
-                    Console.WriteLine($"  order #{message.Sequence} {message.Text}");
-                    break;
-
-                case SampleMessageKind.HeartBeat:
-                    heartBeats++;
-                    Console.WriteLine("  heartbeat");
-                    break;
-            }
-        }
+        client.SendMessage(new SampleMessage { Kind = SampleMessageKind.Order, Sequence = i, Symbol = "EURUSD", Price = 1.0845 + i * 0.0001, Text = "buy 1M" });
     }
-    catch (IOException)
+
+    Console.WriteLine($"  sent {orderCount} orders");
+});
+
+// One subscription per kind of message. They all run on the connection's read loop, one message at a time.
+client.Messages.Where(message => message.Kind == SampleMessageKind.Price).Subscribe(message =>
+{
+    pricesInOrder &= message.Sequence > lastPriceSequence;
+    lastPriceSequence = message.Sequence;
+    if (++prices <= 3)
     {
+        Console.WriteLine($"  price #{message.Sequence} {message.Symbol} {message.Price:F5}");
     }
 });
 
-for (var i = 1; i <= orderCount; i++)
+client.Messages.Where(message => message.Kind == SampleMessageKind.OrderAck).Subscribe(message =>
 {
-    Serializer.SerializeWithLengthPrefix(
-        stream,
-        new SampleMessage { Kind = SampleMessageKind.Order, Sequence = i, Symbol = "EURUSD", Price = 1.0845 + i * 0.0001, Text = "buy 1M" },
-        PrefixStyle.Base128);
-}
+    acknowledged.Add(message.Sequence);
+    Console.WriteLine($"  order #{message.Sequence} {message.Text}");
+});
 
-Console.WriteLine($"Sent {orderCount} orders; listening for {listenFor.TotalSeconds:N0} s");
+client.Messages.Where(message => message.Kind == SampleMessageKind.HeartBeat).Subscribe(_ =>
+{
+    heartBeats++;
+    Console.WriteLine("  heartbeat");
+});
+
+client.Start();
 await Task.Delay(listenFor);
-tcpClient.Close();
-await reading;
+
+// Dispose stops the client; the last state, Disconnected, arrives once its loops have ended.
+client.Dispose();
+await client.State.LastOrDefaultAsync();
 
 var checks = new (string Name, bool Passed)[]
 {
+    ($"connected ({connections} time{(connections == 1 ? "" : "s")})", connections > 0),
     ($"every order acknowledged ({acknowledged.Count}/{orderCount})", acknowledged.Count == orderCount),
     ($"prices received ({prices}) and in order", prices > 0 && pricesInOrder),
     ($"heartbeats received ({heartBeats})", heartBeats > 0),

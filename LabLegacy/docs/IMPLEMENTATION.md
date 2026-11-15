@@ -1,8 +1,9 @@
 # LabLegacy.Neutron implementation
 
-This document describes how the Neutron server works inside: the wire format, how messages are sent and received,
-which threads run what, and how connections close. It is for engineers who maintain the library or write a client
-for it. For what changed from the legacy code and why, see the [README](../README.md).
+This document describes how the Neutron server and client work inside: the wire format, how messages are sent and
+received, which threads run what, how connections close, and how the client reconnects. It is for engineers who
+maintain the library or write a client for it. For what changed from the legacy code and why, see the
+[README](../README.md).
 
 - [Components](#components)
 - [Wire format](#wire-format)
@@ -14,7 +15,8 @@ for it. For what changed from the legacy code and why, see the [README](../READM
 - [Slow clients](#slow-clients)
 - [Configuration](#configuration)
 - [Errors and logging](#errors-and-logging)
-- [Writing a client](#writing-a-client)
+- [The client](#the-client)
+- [Clients without the library](#clients-without-the-library)
 - [Limitations](#limitations)
 
 ## Components
@@ -22,7 +24,9 @@ for it. For what changed from the legacy code and why, see the [README](../READM
 | Type | File | Role |
 |---|---|---|
 | `NeutronAsyncServer<T>` | [NeutronAsyncServer.cs](../LabLegacy.Neutron/NeutronAsyncServer.cs) | Listens, accepts clients, tracks connections by id, broadcasts, sends heartbeats, raises events. |
-| `NeutronClientConnection<T>` | [NeutronClientConnection.cs](../LabLegacy.Neutron/NeutronClientConnection.cs) | One connected client: a read loop, a bounded send queue and a write loop. |
+| `NeutronClientConnection<T>` | [NeutronClientConnection.cs](../LabLegacy.Neutron/NeutronClientConnection.cs) | One connected client, as the server sees it: its id, the slow-client rule and the disconnect event. |
+| `NeutronClient<T>` | [NeutronClient.cs](../LabLegacy.Neutron/NeutronClient.cs) | The client: keeps one connection to a server, replaces it when it is lost, and reports through observables. |
+| `WireConnection` | [WireConnection.cs](../LabLegacy.Neutron/WireConnection.cs) | One socket: a read loop, a bounded send queue and a write loop. Used by both the server's connections and the client, so everything under [Sending](#sending) and [Receiving](#receiving) applies to both ends. |
 | `EncodedMessage` | [EncodedMessage.cs](../LabLegacy.Neutron/EncodedMessage.cs) | A message serialized once into a pooled buffer, already framed, shared between connections by reference count. |
 | `IServerProtoMessageParser<T>` | [Contracts.cs](../LabLegacy.Neutron/Contracts.cs) | Implemented by the application; receives every message a client sends. |
 | `NeutronServerConfig<T>` | [Contracts.cs](../LabLegacy.Neutron/Contracts.cs) | Listening address, heartbeat, queue and size limits. |
@@ -194,11 +198,113 @@ server did. This is a process-wide setting.
 | A client is too slow | Logged as a warning, and that connection closes. |
 | A connection closes | Logged at information level; `OnClientDisconnection` is raised. |
 
-All logging goes through the `ILogger<NeutronAsyncServer<T>>` passed to the server.
+All server logging goes through the `ILogger<NeutronAsyncServer<T>>` passed to the server. The client takes an
+optional `ILogger<NeutronClient<T>>`; it logs each connection, each clean close by the server (information) and
+each failure (warning).
 
-## Writing a client
+## The client
 
-The library has no client class. A client only needs the wire format, which protobuf-net provides directly:
+`NeutronClient<T>` keeps one connection to a server and replaces it whenever it is lost. It reports through three
+observables instead of events:
+
+| Observable | What it carries | Notes |
+|---|---|---|
+| `Messages` | Every message from the server, in order. | Hot. Delivered on the read loop, one at a time. |
+| `State` | `Disconnected`, `Connecting` or `Connected`. | Replays the current state to a new subscriber, then each change. |
+| `Errors` | Why an attempt failed or a connection was lost. | The client carries on after every one. |
+
+All three complete when the client is disposed.
+
+```csharp
+using var client = new NeutronClient<SampleMessage>(new NeutronClientConfig
+{
+    ServerAddress = new IPEndPoint(IPAddress.Loopback, 5080),
+    HeartBeatTimeout = TimeSpan.FromSeconds(6),
+});
+
+client.Messages
+    .Where(message => message.Kind == SampleMessageKind.Price)
+    .Subscribe(price => Console.WriteLine(price.Price));
+
+// Runs on every connection, the first and each reconnect.
+client.State
+    .Where(state => state == NeutronClientState.Connected)
+    .Subscribe(_ => client.SendMessage(new SampleMessage { Kind = SampleMessageKind.Order }));
+
+client.Start();
+```
+
+### Reconnecting
+
+One loop runs from `Start()` until `Dispose()`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected
+    Disconnected --> Connecting: Start()
+    Connecting --> Connected: connected
+    Connecting --> Connecting: attempt failed (reported on Errors), wait, retry
+    Connected --> Connecting: connection lost
+    Connecting --> Disconnected: Dispose()
+    Connected --> Disconnected: Dispose()
+```
+
+- **Backoff.** After a failed attempt or a lost connection the client waits `ReconnectDelay` (100 ms), doubling
+  after each further failure up to `MaxReconnectDelay` (5 s). A successful connection resets it. Each wait is
+  varied by ±25%, so the clients of a restarted server do not all return at the same instant.
+- **Connect timeout.** An attempt that takes longer than `ConnectTimeout` fails with a `TimeoutException`.
+- **Nothing is replayed.** Messages either side sent while the connection was down are lost, and messages still
+  in the client's send queue when the connection dropped are discarded. The server sees a reconnected client as a
+  new connection with a new id. Send whatever the server needs again from a `State` subscription, as above.
+- **Ordering of `Connected`.** `Connected` is published after the connection can send and before its read loop
+  starts, so `SendMessage` works inside the handler and no message from that connection arrives ahead of it.
+
+### Detecting a dead server
+
+A server that stops or crashes closes the socket, and the client notices at once. A server that hangs, or a
+network path that goes quiet, closes nothing. `HeartBeatTimeout` covers that case: when a whole interval passes
+with nothing received, the connection is closed with a `TimeoutException` and replaced.
+
+- Set it to a few times the server's `HeartBeatIntervalInSec`. Any received bytes count, not only heartbeats.
+- The check compares a counter of socket reads once per interval (an `Observable.Interval`), so it costs the
+  receive path nothing. Detection therefore takes between one and two times the timeout.
+- It is off by default (zero).
+
+### Sending from the client
+
+`SendMessage` behaves as it does on the server: it serializes, queues and returns. It returns `false` when there
+is no connection. If the queue is full (`SendQueueCapacity`), the server is not reading fast enough: the message
+is not sent, the reason is reported on `Errors`, and the connection is replaced.
+
+### Client threading
+
+| Code | Runs on |
+|---|---|
+| `Messages` subscribers | The connection's read loop, one message at a time. A slow subscriber delays reading, and the server will drop the client once its queue for it fills. Use `ObserveOn` to move slow work elsewhere. |
+| `State` and `Errors` subscribers | The client's connect loop. Keep them short. |
+| `SendMessage` | The caller's thread. Thread-safe; never blocks. |
+
+A `Messages` subscriber that throws closes the connection (reported on `Errors`), and the client reconnects. A
+`State` or `Errors` subscriber that throws stops the client for good and is logged as critical.
+
+### Client configuration
+
+`NeutronClientConfig`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ServerAddress` | required | An `IPEndPoint`, or a `DnsEndPoint` for a host name. |
+| `ReconnectDelay` | 100 ms | Wait before the first retry; doubles after each failure. |
+| `MaxReconnectDelay` | 5 s | Upper limit for that wait. |
+| `ConnectTimeout` | 5 s | Longest a single connection attempt may take. |
+| `HeartBeatTimeout` | 0 (off) | Silence after which the connection is treated as dead. |
+| `SendQueueCapacity` | 10,000 | Messages that may be waiting to be sent. |
+| `MaxMessageBytes` | 16 MB | Largest message accepted from the server. |
+
+## Clients without the library
+
+A client that cannot use `NeutronClient<T>` (an existing legacy client, or another platform) only needs the wire
+format, which protobuf-net provides directly:
 
 ```csharp
 using var tcpClient = new TcpClient { NoDelay = true };
@@ -210,14 +316,17 @@ var received = Serializer.DeserializeWithLengthPrefix<T>(stream, PrefixStyle.Bas
 ```
 
 Reads and writes can run on different threads. Writes from more than one thread must be serialized by the client,
-or frames will interleave. [SampleClient](../LabLegacy.Neutron.SampleClient/Program.cs) is a complete example.
+or frames will interleave. The `LegacyClient` class in
+[NeutronAsyncServerTests.cs](../LabLegacy.Neutron.Tests/NeutronAsyncServerTests.cs) is a complete example.
 
 ## Limitations
 
 - **No TLS or authentication.** Any process that can reach the port can connect.
 - **No graceful drain on close.** Queued messages are discarded when a connection closes.
 - **No message-type routing.** One root type `T` per server; route inside the parser, for example on a `Kind` field.
-- **No client-side liveness check.** A client that vanishes without closing is only noticed when the next send to it
-  fails, or its queue fills.
+- **No replay after a reconnect.** Whatever was sent while a client was disconnected is lost.
+- **The server does not check clients for liveness.** A client that vanishes without closing is only noticed when
+  the next send to it fails, or its queue fills. The client does check the server; see
+  [Detecting a dead server](#detecting-a-dead-server).
 - **One object allocated per message sent** (the `EncodedMessage` wrapper; its buffer is pooled), plus whatever the
   message type itself allocates when deserialized.
