@@ -4,6 +4,62 @@ A modernised version of a legacy TCP/protobuf server and its per-client connecti
 `NeutronAsyncServer<T>` and `NeutronClientConnection<T>`. The public members and events are the same as the
 originals, and so is the wire format, so existing clients connect unchanged.
 
+For how it works inside (wire format, send and receive paths, threading, connection lifecycle), see
+[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+
+## Projects
+
+| Project | What it is |
+|---|---|
+| `LabLegacy.Neutron` | The library: `NeutronAsyncServer<T>`, `NeutronClientConnection<T>` and their contracts. |
+| `LabLegacy.Neutron.Tests` | Tests, with a legacy-style client on the other end of every connection. |
+| `LabLegacy.Neutron.SampleMessages` | The message type the two samples share. |
+| `LabLegacy.Neutron.SampleServer` | Sample server: heartbeats, a price broadcast, and an acknowledgement for each order. |
+| `LabLegacy.Neutron.SampleClient` | Sample client written the way a legacy client is, with a pass/fail check at the end. |
+
+## Running the samples
+
+Start the server, then the client, in two terminals. Both take an optional port (default 5080) and a number of
+seconds to run:
+
+```powershell
+dotnet run -c Release --project LabLegacy/LabLegacy.Neutron.SampleServer -- 5080
+dotnet run -c Release --project LabLegacy/LabLegacy.Neutron.SampleClient -- 5080 5
+```
+
+The server heartbeats every 2 seconds, broadcasts a price twice a second, and acknowledges each order to the client
+that sent it. The client sends three orders, listens for 5 seconds, and checks what it received. Its exit code is 0
+when every check passes:
+
+```
+Connected to 127.0.0.1:5281
+Sent 3 orders; listening for 5 s
+  order #1 accepted
+  price #1 EURUSD 1.08474
+  order #2 accepted
+  order #3 accepted
+  price #2 EURUSD 1.08530
+  price #3 EURUSD 1.08547
+  heartbeat
+  heartbeat
+
+PASS  every order acknowledged (3/3)
+PASS  prices received (10) and in order
+PASS  heartbeats received (2)
+```
+
+The server's side of the same run:
+
+```
+info: LabLegacy.Neutron.NeutronAsyncServer[0] Starting Neutron Listener on 127.0.0.1:5281
++ client connected: 1d6aaa60-be22-4854-86e9-111d1a2d0a70_127.0.0.1:55714
+  order #1 buy 1M EURUSD @ 1.08460
+  order #2 buy 1M EURUSD @ 1.08470
+  order #3 buy 1M EURUSD @ 1.08480
+info: LabLegacy.Neutron.NeutronAsyncServer[0] connection_id:1d6aaa60-be22-4854-86e9-111d1a2d0a70_127.0.0.1:55714 has stopped
+- client disconnected: 1d6aaa60-be22-4854-86e9-111d1a2d0a70_127.0.0.1:55714
+```
+
 ## Wire format (unchanged)
 
 Each message is a Base128 (varint) length followed by the protobuf-net payload. This is exactly what the legacy code
